@@ -34,8 +34,10 @@ request_log (append-only, one row per proxied request)
 
 * Authentication: the proxy and the builder service authenticate to each other with mTLS client certs, or a shared static internal bearer token over the private network. Not with job tokens — this is the control-plane endpoint.
 * Request body: { "job_id": "...", "tenant_id": "...", "upstream_key_id": "...", "ttl_seconds": 1800, "max_requests": 100, "max_tokens_total": 2_000_000 }
-* The builder service generates the job's bearer token itself (random 32 bytes) and sends it; the proxy stores only its hash. This means the proxy can never re-issue a job token to anyone, and the builder can prove which build the token belongs to. Alternatively the proxy generates it — either is fine; pick one and document it. (Recommend: builder generates, sends hash or token over mTLS.)
-* Response: { "job_id": "...", "expires_at": "...", "proxy_url": "https://proxy.internal:8443/v1" }
+* The proxy generates the job's bearer token itself (random 32 bytes, crypto-secure RNG) and returns it in the issuance response; the proxy stores only its hash. The builder receives the token over the mutually authenticated channel and injects it into the build container.
+  * Decision: the proxy is the token generator, not the builder. Rationale: the proxy owns the data-plane auth domain, token format and entropy requirements are enforced in one place, and the builder never needs logic for token generation. The trade-off is that the proxy momentarily sees the raw token at issuance time (before hashing) — accepted, since the proxy is trusted infrastructure. To keep the builder from having to trust the proxy's channel alone, issuance responses are sent only over mTLS or the shared internal token.
+  * To mitigate token leakage on the proxy side, the raw token exists only in memory of the issuance handler for the duration of the response; it is never logged, never persisted, and never appears in metrics.
+* Response: { "job_id": "...", "token": "...", "expires_at": "...", "proxy_url": "https://proxy.internal:8443/v1" }
 
 2. POST /v1/jobs/{job_id}/revoke — immediate kill switch (builder service, or an admin)
 
