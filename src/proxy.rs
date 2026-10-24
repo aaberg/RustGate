@@ -115,23 +115,52 @@ pub async fn proxy(
             preflight_estimate(fwd, jb, &path)
         })
         .unwrap_or_else(|| estimate_tokens(request_bytes, 0));
+
+    // Cancellation-safe accounting guard. It starts DISARMED (mode None):
+    // a request rejected before reserving anything must not release
+    // reservations owned by concurrent requests (the store clamps at zero,
+    // so a release of a never-made reservation would steal another
+    // request's slot). It is armed (Release) only once the token reservation
+    // succeeds, and every subsequent settlement runs via settle_and_disarm
+    // in a spawned task that survives cancellation.
+    let mut guard = AccountingGuard {
+        state: Some(state.clone()),
+        job_id: job_id.clone(),
+        est_tokens: est,
+        mode: None,
+        counted: false,
+        holds_request: false,
+        holds_tokens: false,
+        settled: false,
+    };
+
     if state.store.reserve_tokens_async(job_id.clone(), est).await.is_none() {
+        // Rejected before any reservation: nothing to settle.
         let e = ApiError::RateLimited("token quota exhausted".into());
         return err_response(&state, Some(&job), &path, request_bytes, &e, started, "token_cap").await;
     }
+    // Token reservation made: from here the guard must release it if this
+    // future is cancelled before settlement.
+    guard.mode = Some(SettleMode::Release);
+    guard.holds_tokens = true;
     if state.store.reserve_request_async(job_id.clone()).await.is_none() {
-        state.store.release_token_reservation_async(job_id.clone(), est).await;
+        // Holds only the token reservation: settle without touching the
+        // request counter (a release there would steal a concurrent
+        // request's pending slot).
+        guard.holds_tokens = true;
+        guard.settle_and_disarm(SettleMode::Release);
         let e = ApiError::RateLimited("request quota exhausted".into());
         return err_response(&state, Some(&job), &path, request_bytes, &e, started, "request_cap").await;
     }
+
+    guard.holds_request = true;
 
     // ---- Concurrency bound (reject saturation immediately; never queue) ----
     let permit = match &state.gate {
         Some(sem) => match sem.clone().try_acquire_owned() {
             Ok(p) => Some(p),
             Err(_) => {
-                state.store.release_request_async(job_id.clone()).await;
-                state.store.release_token_reservation_async(job_id.clone(), est).await;
+                guard.settle_and_disarm(SettleMode::Release);
                 let e = ApiError::Unavailable("saturated".into());
                 return err_response(&state, Some(&job), &path, request_bytes, &e, started, "saturated").await;
             }
@@ -139,17 +168,7 @@ pub async fn proxy(
         None => None,
     };
     state.metrics.in_flight.inc();
-
-    // Cancellation-safe accounting guard: if the handler future is dropped
-    // while waiting for upstream headers (downstream cancellation), neither
-    // forward() branch runs. The guard settles conservatively on drop.
-    let mut guard = AccountingGuard {
-        state: Some(state.clone()),
-        job_id: job_id.clone(),
-        est_tokens: est,
-        forwarded: false,
-        settled: false,
-    };
+    guard.counted = true;
 
     let result = forward(
         state.clone(),
@@ -246,32 +265,18 @@ async fn forward(
     let upstream_resp = match req.body(fwd_body).send().await {
         Ok(r) => r,
         Err(e) => {
-            // The send() call definitively ran: the guard must not settle.
-            guard.forwarded = true;
-            // Transport failure is ambiguous: the upstream may have accepted
-            // the body and burned the call (e.g. connection dropped while
-            // awaiting response headers). Only refund when the failure is
-            // proven to precede forwarding (connect-phase errors).
+            // send() definitively ran: from here the guard settles as
+            // ambiguous/consume. The settlement itself runs in a spawned
+            // task that survives cancellation, and the guard is disarmed
+            // only after the task is *spawned* (not awaited to completion
+            // in this future).
             let is_connect_phase = e.is_connect() || e.is_builder();
-            if is_connect_phase {
-                state.store.release_request_async(job.job_id.clone()).await;
-                state.store.release_token_reservation_async(job.job_id.clone(), est_tokens).await;
-            } else {
-                // Ambiguous: the upstream may have accepted the body and
-                // generated a completion before the transport failed. Consume
-                // the request slot AND charge the reserved token estimate
-                // (conservative; a cost guard must not under-count).
-                state.store.consume_request_async(job.job_id.clone()).await;
-                let st = state.clone();
-                let jid = job.job_id.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    st.store.reconcile_tokens(&jid, est_tokens, est_tokens);
-                })
-                .await;
-            }
+            let mode = if is_connect_phase { SettleMode::Release } else { SettleMode::Consume };
+            guard.settle_and_disarm(mode);
             let msg = e.to_string();
             tracing::warn!(job_id = %job.job_id, path = %path, "upstream forward failed: {msg}");
-            state.store.log_request_async(LogEntry {
+            let _st = state.clone();
+            let log_entry = LogEntry {
                 job_id: job.job_id.clone(),
                 ts: Utc::now(),
                 path: path.clone(),
@@ -285,15 +290,16 @@ async fn forward(
                 tokens_estimated: false,
                 policy_verdict: "upstream_forward_failed".into(),
                 block_reason: None,
-            }).await;
+            };
+            state.store.log_request_async(log_entry).await;
             return Err(ApiError::Upstream(msg).into_response());
         }
     };
 
-    // Response headers received: the upstream call burned the request slot,
-    // and the request definitively reached the upstream (drop from here on
-    // is handled by the stream/buffered finalizers, not the guard).
-    guard.forwarded = true;
+    // Response headers received: the request definitively reached the
+    // upstream. The guard settles as consume, and from here on the
+    // stream/buffered finalizers own cleanup (guard disarmed below).
+    guard.settle_and_disarm(SettleMode::Consume);
     state.store.consume_request_async(job.job_id.clone()).await;
 
     let status = upstream_resp.status();
@@ -414,14 +420,50 @@ async fn forward(
     let finalize_failure = {
         let state = state.clone();
         let job_id = job.job_id.clone();
+        let tenant_id = job.tenant_id.clone();
+        let key_id = job.upstream_key_id.clone();
+        let provider_id = job.provider_id.clone();
+        let path = path.clone();
+        let model = model_of(json_body.as_ref());
+        let request_bytes = raw_body.len();
+        let status_code_final = status_code;
+        let duration_started = started;
         let est = est_tokens;
         move || {
             // Charge the reserved estimate: the upstream may have completed
-            // the generation before the truncation/timeout.
+            // the generation before the truncation/timeout. Also write the
+            // audit row and spend metrics so the charge is observable.
             if let Ok(h) = tokio::runtime::Handle::try_current() {
                 h.spawn(async move {
+                    let entry = LogEntry {
+                        job_id: job_id.clone(),
+                        ts: Utc::now(),
+                        path: path.clone(),
+                        model,
+                        request_bytes,
+                        response_bytes: 0,
+                        status_code: Some(status_code_final),
+                        duration_ms: Some(duration_started.elapsed().as_millis() as u64),
+                        prompt_tokens: Some(est),
+                        completion_tokens: None,
+                        tokens_estimated: true,
+                        policy_verdict: "upstream_incomplete".into(),
+                        block_reason: None,
+                    };
+                    state
+                        .metrics
+                        .tokens_total
+                        .with_label_values(&[&key_id, &provider_id])
+                        .inc_by(est as f64);
+                    state
+                        .metrics
+                        .requests_total
+                        .with_label_values(&[&job_id, &tenant_id, "allowed"])
+                        .inc();
+                    let st = state.clone();
                     let _ = tokio::task::spawn_blocking(move || {
-                        state.store.reconcile_tokens(&job_id, est, est);
+                        st.store.reconcile_tokens(&job_id, est, est);
+                        st.store.log_request(&entry);
                     })
                     .await;
                 });
@@ -574,38 +616,126 @@ async fn err_response(
     (*e).clone().into_response()
 }
 
+/// How an unsettled guard settles on drop:
+/// - Release: the request never definitively reached the upstream (pre-send
+///   cancellation) — release both reservations.
+/// - Consume: the body may have been accepted upstream — consume the request
+///   slot and charge the reserved token estimate (conservative).
+#[derive(Clone, Copy)]
+enum SettleMode {
+    Release,
+    Consume,
+}
+
 /// Cancellation-safe accounting for the reservation window between quota
-/// reservation and upstream response (or failure). If the handler future is
-/// dropped mid-window (downstream cancellation), the guard settles
-/// conservatively: consume the request slot (the body may have been sent)
-/// and charge the reserved token estimate. Idempotent with the normal paths.
+/// reservation and settlement. If the handler future is dropped mid-window
+/// (downstream cancellation), the guard settles in a spawned task that
+/// survives the cancellation. `settled`/`counted` track which cleanup parts
+/// the normal path already performed so nothing is double-charged.
 struct AccountingGuard {
     state: Option<SharedState>,
     job_id: String,
     est_tokens: u64,
-    forwarded: bool,
+    mode: Option<SettleMode>,
+    /// in_flight was incremented (and the guard must decrement it on settle).
+    counted: bool,
+    /// Which reservations this request actually holds: a request rejected at
+    /// the request-cap gate holds only the token reservation, and its
+    /// settlement must not release a request slot it never took (which would
+    /// steal a pending slot from a concurrent in-flight request).
+    holds_request: bool,
+    holds_tokens: bool,
+    /// Settlement complete; drop is a no-op.
     settled: bool,
+}
+
+impl AccountingGuard {
+    /// Run the settlement in a cancellation-immune spawned task and disarm
+    /// the guard immediately (the task owns cleanup from this point).
+    fn settle_and_disarm(&mut self, mode: SettleMode) {
+        self.mode = Some(mode);
+        self.settled = true;
+        let state = match self.state.take() {
+            Some(s) => s,
+            None => return,
+        };
+        let job_id = self.job_id.clone();
+        let est = self.est_tokens;
+        let counted = self.counted;
+        let holds_request = self.holds_request;
+        let holds_tokens = self.holds_tokens;
+        if let Ok(h) = tokio::runtime::Handle::try_current() {
+            h.spawn(async move {
+                match mode {
+                    SettleMode::Release => {
+                        if holds_request {
+                            state.store.release_request_async(job_id.clone()).await;
+                        }
+                        if holds_tokens {
+                            state.store.release_token_reservation_async(job_id.clone(), est).await;
+                        }
+                    }
+                    SettleMode::Consume => {
+                        if holds_request {
+                            state.store.consume_request_async(job_id.clone()).await;
+                        }
+                        if holds_tokens {
+                            let st = state.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                st.store.reconcile_tokens(&job_id, est, est);
+                            })
+                            .await;
+                        }
+                    }
+                }
+                if counted {
+                    state.metrics.in_flight.dec();
+                }
+            });
+        }
+    }
 }
 
 impl Drop for AccountingGuard {
     fn drop(&mut self) {
-        if self.settled || self.forwarded || self.state.is_none() {
+        if self.settled || self.state.is_none() {
             return;
         }
+        let Some(mode) = self.mode else { return };
         let state = self.state.take().unwrap();
         let job_id = self.job_id.clone();
         let est = self.est_tokens;
-        // Fire-and-forget on drop: cannot await; use Handle::try_current
-        // and let the reconciliation run as a spawned task.
+        let counted = self.counted;
+        let holds_request = self.holds_request;
+        let holds_tokens = self.holds_tokens;
+        // Fire-and-forget on drop: the spawned task survives cancellation.
         if let Ok(h) = tokio::runtime::Handle::try_current() {
             h.spawn(async move {
-                state.store.consume_request_async(job_id.clone()).await;
-                let st = state.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    st.store.reconcile_tokens(&job_id, est, est);
-                })
-                .await;
-                state.metrics.in_flight.dec();
+                match mode {
+                    SettleMode::Release => {
+                        if holds_request {
+                            state.store.release_request_async(job_id.clone()).await;
+                        }
+                        if holds_tokens {
+                            state.store.release_token_reservation_async(job_id.clone(), est).await;
+                        }
+                    }
+                    SettleMode::Consume => {
+                        if holds_request {
+                            state.store.consume_request_async(job_id.clone()).await;
+                        }
+                        if holds_tokens {
+                            let st = state.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                st.store.reconcile_tokens(&job_id, est, est);
+                            })
+                            .await;
+                        }
+                    }
+                }
+                if counted {
+                    state.metrics.in_flight.dec();
+                }
             });
         }
     }

@@ -22,11 +22,39 @@ pub const DEFAULT_COMPLETION_ALLOWANCE: u64 = 4096;
 /// with a small remaining budget doesn't authorize an unbounded generation.
 /// All arithmetic saturates — a declared limit of u64::MAX must not wrap the
 /// estimate small enough to pass the quota gate.
+/// Count token IDs in an embeddings `input`: a flat array of IDs, a batch
+/// (array of arrays), or non-array content (None — byte estimate applies).
+fn embedding_input_ids(input: &serde_json::Value) -> Option<u64> {
+    match input {
+        serde_json::Value::Array(items) => {
+            let mut total = 0u64;
+            for item in items {
+                match item {
+                    serde_json::Value::Number(_) => total += 1,
+                    serde_json::Value::Array(inner) => total += inner.len() as u64,
+                    _ => return None,
+                }
+            }
+            Some(total)
+        }
+        _ => None,
+    }
+}
+
 pub fn preflight_estimate(request_bytes: usize, body: &serde_json::Value, path: &str) -> u64 {
     let req_est = (request_bytes as u64) / BYTES_PER_TOKEN;
     if path == "/v1/embeddings" {
         // Embeddings generate no completion tokens: input-only estimate.
-        return req_est.saturating_add(PER_REQUEST_OVERHEAD_TOKENS);
+        // Token-ID arrays are counted directly: 1,000 one-digit IDs serialize
+        // to only ~527 bytes/4 tokens, which would under-reserve vs. the
+        // explicit token count the upstream actually bills.
+        let id_count = body
+            .get("input")
+            .and_then(embedding_input_ids)
+            .unwrap_or(0);
+        return req_est
+            .max(id_count)
+            .saturating_add(PER_REQUEST_OVERHEAD_TOKENS);
     }
     let declared = body
         .get("max_completion_tokens")
@@ -68,6 +96,22 @@ mod tests {
         let body = json!({"max_tokens": 1000, "n": 10});
         let est = preflight_estimate(400, &body, "/v1/chat/completions");
         assert_eq!(est, 100 + 10_000 + PER_REQUEST_OVERHEAD_TOKENS);
+    }
+
+    #[test]
+    fn embedding_token_id_array_counted_directly() {
+        // 1000 one-digit IDs: bytes/4 would estimate far fewer than 1000.
+        let ids: Vec<u32> = (0..1000).collect();
+        let body = json!({"model": "text-embedding", "input": ids});
+        let est = preflight_estimate(400, &body, "/v1/embeddings");
+        assert!(est >= 1000, "estimate {est} must cover the explicit token count");
+    }
+
+    #[test]
+    fn embedding_batched_id_arrays_counted() {
+        let body = json!({"input": [[1, 2, 3], [4, 5, 6, 7]]});
+        let est = preflight_estimate(200, &body, "/v1/embeddings");
+        assert!(est >= 7, "estimate {est} must cover the batched token count");
     }
 
     #[test]
