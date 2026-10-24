@@ -113,7 +113,12 @@ pub async fn issue_job(
         "job issued"
     );
 
-    let proxy_url = format!("https://{}:{}/v1", state.cfg.listen_addr, state.cfg.listen_port);
+    let scheme = if state.cfg.allow_insecure && state.cfg.tls_cert_path.is_none() {
+        "http"
+    } else {
+        "https"
+    };
+    let proxy_url = format!("{}://{}:{}/v1", scheme, state.cfg.listen_addr, state.cfg.listen_port);
     Ok(Json(json!({
         "job_id": job_id,
         "token": token,

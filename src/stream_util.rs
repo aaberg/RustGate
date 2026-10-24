@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const IDLE_STREAM_TIMEOUT: Duration = Duration::from_secs(120);
-const SSE_DATA_PREFIX: &str = "data: ";
+const SSE_DATA_PREFIX: &str = "data:";
 
 type Finalize = Box<dyn FnOnce(u64, Option<Usage>) + Send>;
 
@@ -17,6 +17,15 @@ struct StreamState {
     sse_buffer: Vec<u8>,
     metrics: Option<crate::metrics::Metrics>,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl Drop for StreamState {
+    fn drop(&mut self) {
+        // Client disconnects drop the response stream without polling it to
+        // EOF: charge observed bytes here so accounting, audit, in-flight and
+        // the permit are always reconciled. finish() is idempotent.
+        finish(self);
+    }
 }
 
 /// Pass-through body stream: flushes chunks immediately, sniffs SSE data
@@ -82,7 +91,7 @@ fn sniff_sse(buffer: &mut Vec<u8>, adapter: &dyn ProviderAdapter, chunk: &Bytes,
         let Some(payload) = line.strip_prefix(SSE_DATA_PREFIX) else {
             continue;
         };
-        let payload = payload.trim();
+        let payload = payload.trim_start();
         if payload == "[DONE]" {
             continue;
         }
@@ -96,7 +105,7 @@ fn sniff_sse(buffer: &mut Vec<u8>, adapter: &dyn ProviderAdapter, chunk: &Bytes,
 
 fn finish(s: &mut StreamState) {
     if let Some(f) = s.finalize.take() {
-        f(s.total, s.usage);
+        f(s.total, s.usage.take());
     }
     if let Some(m) = &s.metrics {
         m.in_flight.dec();

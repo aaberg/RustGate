@@ -85,13 +85,21 @@ impl ProviderAdapter for OpenAICompatible {
             && self.cfg.request_stream_usage
             && body.get("stream").and_then(|s| s.as_bool()) == Some(true)
         {
-            let so = body
-                .as_object_mut()
-                .map(|o| o.entry("stream_options").or_insert(Value::Null));
-            if let Some(Value::Null) = so {
-                *so.unwrap() = serde_json::json!({ "include_usage": true });
-            } else if let Some(v) = so {
-                v["include_usage"] = Value::Bool(true);
+            if let Some(obj) = body.as_object_mut() {
+                match obj.get_mut("stream_options") {
+                    Some(Value::Object(opts)) => {
+                        opts.insert("include_usage".to_string(), Value::Bool(true));
+                    }
+                    _ => {
+                        // absent, null, or malformed (string/array/etc.):
+                        // (re)place with a valid options object; upstream
+                        // validates the rest of the request.
+                        obj.insert(
+                            "stream_options".to_string(),
+                            serde_json::json!({ "include_usage": true }),
+                        );
+                    }
+                }
             }
         }
     }

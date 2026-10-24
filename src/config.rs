@@ -34,7 +34,7 @@ pub struct Config {
 pub struct ProviderConfig {
     pub base_url: String,
     /// Forwardable upstream paths; defaults to the OpenAI-compatible set.
-    #[serde(default)]
+    #[serde(default = "default_allow_paths")]
     pub allow_paths: Vec<String>,
     /// Extra secret-scan regexes specific to this provider's key shapes.
     #[serde(default)]
@@ -121,58 +121,91 @@ impl Config {
                 )));
             }
         }
-        if !self.allow_insecure && self.tls_cert_path.is_none() {
-            return Err(ConfigError::Validation(
-                "TLS cert path required (or set allow_insecure for dev)".into(),
-            ));
+        if !self.allow_insecure {
+            match (&self.tls_cert_path, &self.tls_key_path) {
+                (None, None) => {
+                    return Err(ConfigError::Validation(
+                        "TLS cert+key paths required (or set allow_insecure for dev)".into(),
+                    ))
+                }
+                (Some(_), None) => {
+                    return Err(ConfigError::Validation(
+                        "tls_cert_path set but tls_key_path missing".into(),
+                    ))
+                }
+                (None, Some(_)) => {
+                    return Err(ConfigError::Validation(
+                        "tls_key_path set but tls_cert_path missing".into(),
+                    ))
+                }
+                _ => {}
+            }
         }
         Ok(())
+    }
+
+    /// Load configuration: optional JSON config file (RUSTGATE_CONFIG),
+    /// then RUSTGATE_* env overrides on top.
+    pub fn load() -> Result<Self, ConfigError> {
+        if let Ok(path) = std::env::var("RUSTGATE_CONFIG") {
+            let mut cfg = Self::from_file(&std::path::PathBuf::from(path))?;
+            cfg.apply_env_overrides()?;
+            cfg.validate()?;
+            Ok(cfg)
+        } else {
+            Self::from_env()
+        }
     }
 
     /// Load from environment variables (RUSTGATE_*), falling back to defaults.
     pub fn from_env() -> Result<Self, ConfigError> {
         let mut cfg = Config::default();
+        cfg.apply_env_overrides()?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    fn apply_env_overrides(&mut self) -> Result<(), ConfigError> {
         if let Ok(v) = std::env::var("RUSTGATE_LISTEN_ADDR") {
-            cfg.listen_addr = v;
+            self.listen_addr = v;
         }
         if let Ok(v) = std::env::var("RUSTGATE_LISTEN_PORT") {
-            cfg.listen_port = v
+            self.listen_port = v
                 .parse()
                 .map_err(|_| ConfigError::Validation("bad RUSTGATE_LISTEN_PORT".into()))?;
         }
         if let Ok(v) = std::env::var("RUSTGATE_SQLITE_PATH") {
-            cfg.sqlite_path = PathBuf::from(v);
+            self.sqlite_path = PathBuf::from(v);
         }
         if let Ok(v) = std::env::var("RUSTGATE_SECRETS_FILE") {
-            cfg.secrets_file = Some(PathBuf::from(v));
+            self.secrets_file = Some(PathBuf::from(v));
         }
         if let Ok(v) = std::env::var("RUSTGATE_CONTROL_TOKEN") {
-            cfg.control_token = Some(v);
+            self.control_token = Some(v);
         }
         if let Ok(v) = std::env::var("RUSTGATE_TLS_CERT") {
-            cfg.tls_cert_path = Some(PathBuf::from(v));
+            self.tls_cert_path = Some(PathBuf::from(v));
         }
         if let Ok(v) = std::env::var("RUSTGATE_TLS_KEY") {
-            cfg.tls_key_path = Some(PathBuf::from(v));
+            self.tls_key_path = Some(PathBuf::from(v));
         }
         if let Ok(_) = std::env::var("RUSTGATE_ALLOW_INSECURE") {
-            cfg.allow_insecure = true;
+            self.allow_insecure = true;
         }
         if let Ok(v) = std::env::var("RUSTGATE_UPSTREAM_BASE_URL") {
-            if let Some(p) = cfg.providers.get_mut("mistral") {
+            if let Some(p) = self.providers.get_mut("mistral") {
                 p.base_url = v;
             }
         }
         if let Ok(v) = std::env::var("RUSTGATE_CONTROL_TOKEN_FILE") {
-            cfg.control_token = Some(
+            self.control_token = Some(
                 std::fs::read_to_string(v)
                     .map_err(|e| ConfigError::Io(e.to_string()))?
                     .trim()
                     .to_string(),
             );
         }
-        cfg.validate()?;
-        Ok(cfg)
+        Ok(())
     }
 }
 

@@ -46,8 +46,10 @@ impl Store {
                 expires_at TEXT NOT NULL,
                 max_requests INTEGER NOT NULL,
                 requests_used INTEGER NOT NULL DEFAULT 0,
+                pending_requests INTEGER NOT NULL DEFAULT 0,
                 max_tokens_total INTEGER NOT NULL,
                 tokens_used INTEGER NOT NULL DEFAULT 0,
+                tokens_reserved INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'active',
                 revoked_at TEXT,
                 revoked_reason TEXT
@@ -69,6 +71,7 @@ impl Store {
                 block_reason TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_jobs_tenant ON jobs(tenant_id);
+            CREATE INDEX IF NOT EXISTS idx_jobs_status_expires ON jobs(status, expires_at);
             CREATE INDEX IF NOT EXISTS idx_log_job ON request_log(job_id);
             CREATE INDEX IF NOT EXISTS idx_log_ts ON request_log(ts);
             "#,
@@ -131,14 +134,16 @@ impl Store {
         .unwrap_or(None)
     }
 
-    /// Atomic request-cap reservation. Returns Some(()) if incremented within
-    /// the cap, None if the cap is exhausted (job is marked exhausted).
+    /// Atomic request-cap reservation. Returns Some(()) if reserved within the
+    /// cap, None otherwise (job marked exhausted when the cap is the cause).
+    /// Pending reservations are tracked separately from consumed calls so a
+    /// connect-failure refund cannot leave the job terminally exhausted with
+    /// zero consumed calls.
     pub fn reserve_request(&self, job_id: &str) -> Option<()> {
         let conn = self.0.lock().unwrap();
         let n = conn
             .execute(
-                "UPDATE jobs SET requests_used = requests_used + 1
-                 WHERE job_id = ?1 AND status = 'active' AND requests_used < max_requests",
+                "UPDATE jobs SET pending_requests = pending_requests + 1 WHERE job_id = ?1 AND status = 'active' AND requests_used + pending_requests < max_requests",
                 params![job_id],
             )
             .map_err(StoreError::Sql)
@@ -146,10 +151,9 @@ impl Store {
         if n == 1 {
             Some(())
         } else {
-            // Mark exhausted only if the cap is what stopped us (not revocation).
             let capped: Option<i64> = conn
                 .query_row(
-                    "SELECT requests_used >= max_requests FROM jobs WHERE job_id = ?1 AND status = 'active'",
+                    "SELECT requests_used + pending_requests >= max_requests FROM jobs WHERE job_id = ?1 AND status = 'active'",
                     params![job_id],
                     |r| r.get(0),
                 )
@@ -165,13 +169,86 @@ impl Store {
         }
     }
 
-    /// Release a request reservation when the proxy failed before forwarding.
+    /// Mark a request reservation as consumed (the upstream call burned it).
+    pub fn consume_request(&self, job_id: &str) {
+        let conn = self.0.lock().unwrap();
+        let _ = conn.execute(
+            "UPDATE jobs SET requests_used = requests_used + 1, pending_requests = MAX(pending_requests - 1, 0) WHERE job_id = ?1",
+            params![job_id],
+        );
+    }
+
+    /// Release a pending request reservation when the proxy failed before
+    /// forwarding. If the job was marked exhausted only because of pending
+    /// pressure, re-activate it (no upstream call was burned).
     pub fn release_request(&self, job_id: &str) {
         let conn = self.0.lock().unwrap();
         let _ = conn.execute(
-            "UPDATE jobs SET requests_used = MAX(requests_used - 1, 0) WHERE job_id = ?1",
+            "UPDATE jobs SET pending_requests = MAX(pending_requests - 1, 0) WHERE job_id = ?1",
             params![job_id],
         );
+        let _ = conn.execute(
+            "UPDATE jobs SET status = 'active' WHERE job_id = ?1 AND status = 'exhausted' AND requests_used + pending_requests < max_requests AND tokens_used + tokens_reserved < max_tokens_total",
+            params![job_id],
+        );
+    }
+
+    /// Atomically reserve estimated tokens before forwarding. Fails when the
+    /// remaining budget cannot cover the estimate (job marked exhausted).
+    pub fn reserve_tokens(&self, job_id: &str, est_tokens: u64) -> Option<()> {
+        let conn = self.0.lock().unwrap();
+        let n = conn
+            .execute(
+                "UPDATE jobs SET tokens_reserved = tokens_reserved + ?2 WHERE job_id = ?1 AND status = 'active' AND tokens_used + tokens_reserved + ?2 <= max_tokens_total",
+                params![job_id, est_tokens],
+            )
+            .map_err(StoreError::Sql)
+            .unwrap_or(0);
+        if n == 1 {
+            Some(())
+        } else {
+            let _ = conn.execute(
+                "UPDATE jobs SET status = 'exhausted' WHERE job_id = ?1 AND status = 'active'",
+                params![job_id],
+            );
+            None
+        }
+    }
+
+    /// Release a token reservation when the proxy failed before forwarding.
+    pub fn release_token_reservation(&self, job_id: &str, est_tokens: u64) {
+        let conn = self.0.lock().unwrap();
+        let _ = conn.execute(
+            "UPDATE jobs SET tokens_reserved = MAX(tokens_reserved - ?2, 0) WHERE job_id = ?1",
+            params![job_id, est_tokens],
+        );
+    }
+
+    /// Reconcile a reservation with actual usage on completion. Returns true
+    /// if the job hit its token cap (marked exhausted). If actual usage
+    /// leaves remaining budget, a job marked exhausted by an over-large
+    /// estimate is reactivated (the estimate was provisional, the burn is real).
+    pub fn reconcile_tokens(&self, job_id: &str, est_tokens: u64, actual_tokens: u64) -> bool {
+        let conn = self.0.lock().unwrap();
+        let _ = conn.execute(
+            "UPDATE jobs SET tokens_reserved = MAX(tokens_reserved - ?2, 0), tokens_used = tokens_used + ?3 WHERE job_id = ?1",
+            params![job_id, est_tokens, actual_tokens],
+        );
+        let exhausted = conn
+            .execute(
+                "UPDATE jobs SET status = 'exhausted' WHERE job_id = ?1 AND status = 'active' AND tokens_used >= max_tokens_total",
+                params![job_id],
+            )
+            .map_err(StoreError::Sql)
+            .unwrap_or(0) == 1;
+        if !exhausted {
+            // Re-estimate after reconciliation: budget may remain.
+            let _ = conn.execute(
+                "UPDATE jobs SET status = 'active' WHERE job_id = ?1 AND status = 'exhausted' AND tokens_used + tokens_reserved < max_tokens_total AND expires_at > ?2",
+                params![job_id, Utc::now().to_rfc3339()],
+            );
+        }
+        exhausted
     }
 
     /// Reconcile tokens after a request completes. Returns false if the
@@ -307,10 +384,11 @@ pub struct NewJob {
     pub status: String,
 }
 
-pub struct LogEntry<'a> {
-    pub job_id: &'a str,
+#[derive(Clone)]
+pub struct LogEntry {
+    pub job_id: String,
     pub ts: DateTime<Utc>,
-    pub path: &'a str,
+    pub path: String,
     pub model: Option<String>,
     pub request_bytes: usize,
     pub response_bytes: usize,
@@ -319,8 +397,58 @@ pub struct LogEntry<'a> {
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub tokens_estimated: bool,
-    pub policy_verdict: &'a str,
-    pub block_reason: Option<&'a str>,
+    pub policy_verdict: String,
+    pub block_reason: Option<String>,
+}
+
+// Async wrappers: SQLite calls block (busy_timeout up to 5s); running them
+// on Tokio workers can stall the runtime under load. Every call site in an
+// async context must use these wrappers (or spawn_blocking) instead of the
+// synchronous methods.
+macro_rules! async_op {
+    ($self:ident . $m:ident ( $($arg:expr),* )) => {{
+        let store = $self.clone();
+        tokio::task::spawn_blocking(move || store.$m($($arg),*)).await.unwrap()
+    }};
+}
+
+impl Store {
+    pub async fn job_by_hash_async(&self, token_hash: String) -> Option<JobPolicySnapshot> {
+        async_op!(self.job_by_hash(&token_hash))
+    }
+    pub async fn job_by_id_async(&self, job_id: String) -> Option<JobPolicySnapshot> {
+        async_op!(self.job_by_id(&job_id))
+    }
+    pub async fn reserve_request_async(&self, job_id: String) -> Option<()> {
+        async_op!(self.reserve_request(&job_id))
+    }
+    pub async fn release_request_async(&self, job_id: String) {
+        async_op!(self.release_request(&job_id))
+    }
+    pub async fn consume_request_async(&self, job_id: String) {
+        async_op!(self.consume_request(&job_id))
+    }
+    pub async fn reserve_tokens_async(&self, job_id: String, est: u64) -> Option<()> {
+        async_op!(self.reserve_tokens(&job_id, est))
+    }
+    pub async fn release_token_reservation_async(&self, job_id: String, est: u64) {
+        async_op!(self.release_token_reservation(&job_id, est))
+    }
+    pub async fn reconcile_tokens_async(&self, job_id: String, est: u64, actual: u64) -> bool {
+        async_op!(self.reconcile_tokens(&job_id, est, actual))
+    }
+    pub async fn mark_status_async(&self, job_id: String, status: String, reason: Option<String>) -> bool {
+        async_op!(self.mark_status(&job_id, &status, reason.as_deref()))
+    }
+    pub async fn sweep_expired_async(&self) -> usize {
+        async_op!(self.sweep_expired())
+    }
+    pub async fn get_system_prompt_async(&self, job_id: String) -> Option<String> {
+        async_op!(self.get_system_prompt(&job_id))
+    }
+    pub async fn log_request_async(&self, e: LogEntry) {
+        async_op!(self.log_request(&e))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -384,6 +512,66 @@ mod tests {
         assert_eq!(snap(&s, "j").status, "active");
         assert!(s.add_tokens("j", 60)); // 120 >= 100: marks exhausted
         assert_eq!(snap(&s, "j").status, "exhausted");
+    }
+
+    #[test]
+    fn release_pending_reactivates_exhausted() {
+        let s = Store::open_memory().unwrap();
+        s.create_job(&NewJob {
+            job_id: "j".into(),
+            tenant_id: "t".into(),
+            provider_id: "mistral".into(),
+            upstream_key_id: "k".into(),
+            token_hash: "h".into(),
+            system_prompt: None,
+            created_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::minutes(30),
+            max_requests: 1,
+            max_tokens_total: 1_000_000,
+            status: "active".into(),
+        })
+        .unwrap();
+        // A reserves the only slot; B's failed reserve marks exhausted.
+        assert!(s.reserve_request("j").is_some());
+        assert!(s.reserve_request("j").is_none());
+        assert_eq!(snap(&s, "j").status, "exhausted");
+        // A's connect fails before forwarding: refund reactivates the job.
+        s.release_request("j");
+        assert_eq!(snap(&s, "j").status, "active");
+        assert_eq!(snap(&s, "j").requests_used, 0);
+        // Retry now works.
+        assert!(s.reserve_request("j").is_some());
+        s.consume_request("j");
+        assert!(s.reserve_request("j").is_none());
+        assert_eq!(snap(&s, "j").status, "exhausted");
+    }
+
+    #[test]
+    fn token_reservation_holds_concurrent_budget() {
+        let s = Store::open_memory().unwrap();
+        s.create_job(&NewJob {
+            job_id: "j".into(),
+            tenant_id: "t".into(),
+            provider_id: "mistral".into(),
+            upstream_key_id: "k".into(),
+            token_hash: "h".into(),
+            system_prompt: None,
+            created_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::minutes(30),
+            max_requests: 10,
+            max_tokens_total: 100,
+            status: "active".into(),
+        })
+        .unwrap();
+        // Two concurrent 60-token estimates: only the first fits.
+        assert!(s.reserve_tokens("j", 60).is_some());
+        assert!(s.reserve_tokens("j", 60).is_none());
+        // Reconcile with the actual 10 tokens used: reservation released,
+        // job stays active (10 < 100 cap), so reconcile returns false.
+        assert!(!s.reconcile_tokens("j", 60, 10));
+        assert_eq!(snap(&s, "j").tokens_used, 10);
+        // The second call now fits again.
+        assert!(s.reserve_tokens("j", 60).is_some());
     }
 
     #[test]

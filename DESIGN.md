@@ -116,12 +116,12 @@ Three-tier, in priority order:
 2. If a stream ends without usage (disconnect, mid-stream error, idle timeout): estimate `request_bytes/4 + response_bytes/4 + 16` and set `tokens_estimated = 1` on the log row. A cost guard must not under-count.
 3. Never count nothing.
 
-The token cap is enforced pre-flight as a gate (`tokens_used + preflight_estimate > max_tokens_total` → 429 + mark exhausted; the estimate prefers the request's declared `max_tokens`) and post-hoc as an increment on completion. The cap can therefore be exceeded by at most one in-flight request's estimate — accepted slack.
+The token cap is enforced by an **atomic reservation** before forwarding (`tokens_reserved += est WHERE tokens_used + tokens_reserved + est <= max_tokens_total`), reconciled to actual usage on completion. Estimates use the *forwarded* body size (injected operator prompt included) and prefer the request's declared completion limit (`max_completion_tokens`, then legacy `max_tokens`; saturating arithmetic), applying a conservative default completion allowance when neither is declared. Concurrent calls can no longer spend the same remaining budget; the reservation is provisional, so reconciliation reactivates a job that was marked exhausted by an over-large estimate when actual usage leaves budget.
 
 ### 2. Reservation semantics
-- `requests_used` is incremented atomically before forwarding via `UPDATE ... WHERE requests_used < max_requests` (rows-affected = reservation). This holds the cap under concurrency without a reservation table.
-- Tokens use the pre-flight gate only (see 1); no token reservation.
-- The request reservation is released only when the proxy fails *before* forwarding (upstream connect error). A burned upstream call is a burned call.
+- Requests are reserved atomically before forwarding via `pending_requests` (`UPDATE ... WHERE requests_used + pending_requests < max_requests`); the reservation converts to `requests_used` when upstream response headers arrive (the call burned). Pending and consumed are tracked separately so a connect-failure refund cannot strand the job terminally exhausted with zero burned calls; refunds reactivate jobs exhausted only by pending pressure.
+- Tokens use an atomic reservation (see 1), not just a snapshot gate.
+- Reservations are released only for failures proven to precede forwarding (connect/builder-phase errors). Ambiguous transport failures (body possibly accepted upstream) consume the slot — a burned upstream call is a burned call.
 
 ### 3. Control-plane auth
 `POST /v1/jobs`, `/revoke`, `/done` all require the same control-plane credential: a shared static bearer token (constant-time compared) or mTLS-terminated connection. Under the shared-token model, `/revoke` additionally verifies `tenant_id` in the body matches the job's tenant, so one tenant's builder cannot revoke another's job. A distinct admin credential (revoking any tenant's job) is a config-time role decision deferred to v2; v1 treats the control token as the admin credential.

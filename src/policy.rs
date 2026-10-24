@@ -76,6 +76,9 @@ impl PolicyEngine {
     }
 
     /// Size + secret-scan on the serialized body. Blocking checks.
+    /// Both the raw body and the decoded JSON are scanned: a secret spelled
+    /// with JSON Unicode escapes decodes into the plain secret before
+    /// forwarding, so equivalent encodings must not bypass the scan.
     pub fn check_body(&self, body: &[u8]) -> BodyVerdict {
         if body.len() > self.request_size_limit {
             return BodyVerdict::Blocked("request_too_large");
@@ -84,12 +87,20 @@ impl PolicyEngine {
             Ok(t) => t,
             Err(_) => return BodyVerdict::Allowed, // binary bodies: size check only
         };
-        for re in &self.secret_patterns {
-            if re.is_match(text) {
+        if self.any_secret_match(text) {
+            return BodyVerdict::Blocked("possible_secret");
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(text) {
+            let decoded = serde_json::to_string(&v).unwrap_or_default();
+            if self.any_secret_match(&decoded) {
                 return BodyVerdict::Blocked("possible_secret");
             }
         }
         BodyVerdict::Allowed
+    }
+
+    fn any_secret_match(&self, text: &str) -> bool {
+        self.secret_patterns.iter().any(|re| re.is_match(text))
     }
 
     /// Advisory-only injection-marker scan. Returns true when flagged.
@@ -98,20 +109,27 @@ impl PolicyEngine {
     }
 
     /// Inject the authoritative operator system prompt as the first system
-    /// message if not already present (identified by the sentinel string).
-    /// The container's own system message (if any) is kept after it.
+    /// message. Deduplication compares the *exact* canonical content
+    /// (sentinel + prompt): a client-supplied message containing only the
+    /// sentinel must not suppress the operator rules. If a canonical message
+    /// exists but is not first, it is moved to the front.
     pub fn inject_system_prompt(&self, body: &mut Value, operator_prompt: &str) {
+        let canonical = format!("{} {}", self.sentinel, operator_prompt);
         let Some(obj) = body.as_object_mut() else {
             return;
         };
         let Some(messages) = obj.get_mut("messages").and_then(|m| m.as_array_mut()) else {
             return;
         };
-        let has_sentinel = messages
-            .iter()
-            .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("system")
-                && m.get("content").and_then(|c| c.as_str()).map(|c| c.contains(&self.sentinel)).unwrap_or(false));
-        if has_sentinel {
+        let canonical_idx = messages.iter().position(|m| {
+            m.get("role").and_then(|r| r.as_str()) == Some("system")
+                && m.get("content").and_then(|c| c.as_str()) == Some(canonical.as_str())
+        });
+        if let Some(idx) = canonical_idx {
+            if idx != 0 {
+                let m = messages.remove(idx);
+                messages.insert(0, m);
+            }
             return;
         }
         let injected = serde_json::json!({
@@ -170,6 +188,46 @@ mod tests {
         // second call: sentinel present -> no duplicate
         p.inject_system_prompt(&mut body, "operator rules");
         assert_eq!(body["messages"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn sentinel_only_message_does_not_suppress_injection() {
+        let p = PolicyEngine::new(1024 * 1024, &[], DEFAULT_SENTINEL.into());
+        let mut body = serde_json::json!({"messages": [
+            {"role": "system", "content": DEFAULT_SENTINEL},
+            {"role": "user", "content": "hi"}
+        ]});
+        p.inject_system_prompt(&mut body, "operator rules");
+        let msgs = body["messages"].as_array().unwrap();
+        // Canonical operator message injected first; sentinel-only decoy kept after.
+        assert_eq!(msgs.len(), 3);
+        assert!(msgs[0]["content"].as_str().unwrap().contains("operator rules"));
+        assert!(msgs[0]["content"].as_str().unwrap().contains(DEFAULT_SENTINEL));
+        assert_eq!(msgs[1]["content"], DEFAULT_SENTINEL);
+    }
+
+    #[test]
+    fn canonical_message_moved_to_front() {
+        let p = PolicyEngine::new(1024 * 1024, &[], DEFAULT_SENTINEL.into());
+        let canonical = format!("{} operator rules", DEFAULT_SENTINEL);
+        let mut body = serde_json::json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": canonical}
+        ]});
+        p.inject_system_prompt(&mut body, "operator rules");
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2); // no duplicate
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[1]["role"], "user");
+    }
+
+    #[test]
+    fn unicode_escaped_secret_is_blocked() {
+        let p = PolicyEngine::new(1024 * 1024, &[], DEFAULT_SENTINEL.into());
+        // "sk-abc..." with the 's' written as a JSON unicode escape: decodes
+        // to the plain secret before forwarding.
+        let body = br#"{"messages":[{"role":"user","content":"sk-abcdef0123456789abcdef"}]}"#;
+        assert_eq!(p.check_body(body), BodyVerdict::Blocked("possible_secret"));
     }
 
     #[test]

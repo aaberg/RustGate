@@ -32,19 +32,18 @@ pub async fn proxy(
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(|s| s.to_string());
     let Some(token) = token else {
-        return err_response(&state, None, &path, body.len(), &e_unauthorized(), started, "no_token");
+        return err_response(&state, None, &path, body.len(), &e_unauthorized(), started, "no_token").await;
     };
     let token_hash = hex::encode(Sha256::digest(token.as_bytes()));
-    let Some(job) = state.store.job_by_hash(&token_hash) else {
-        return err_response(&state, None, &path, body.len(), &e_unauthorized(), started, "unknown_token");
+    let Some(job) = state.store.job_by_hash_async(token_hash).await else {
+        return err_response(&state, None, &path, body.len(), &e_unauthorized(), started, "unknown_token").await;
     };
 
     let job_id = job.job_id.clone();
     let tenant_id = job.tenant_id.clone();
     let request_bytes = body.len();
 
-    // ---- AuthZ / state ----
-    state.store.sweep_expired();
+    // ---- AuthZ / state (per-job lazy expiry; global sweeps are periodic) ----
     if job.status != "active" {
         let reason = format!("status_{}", job.status);
         // Quota exhaustion is a 429 (design: "clear error"); everything
@@ -54,11 +53,11 @@ pub async fn proxy(
         } else {
             e_unauthorized()
         };
-        return err_response(&state, Some(&job), &path, request_bytes, &e, started, &reason);
+        return err_response(&state, Some(&job), &path, request_bytes, &e, started, &reason).await;
     }
     if job.expires_at < Utc::now() {
-        state.store.mark_status(&job_id, "expired", None);
-        return err_response(&state, Some(&job), &path, request_bytes, &e_unauthorized(), started, "expired");
+        state.store.mark_status_async(job_id.clone(), "expired".into(), None).await;
+        return err_response(&state, Some(&job), &path, request_bytes, &e_unauthorized(), started, "expired").await;
     }
 
     // ---- Path allowlist (proxy-wide; adapter confirms) ----
@@ -66,12 +65,12 @@ pub async fn proxy(
         Some(a) => a,
         None => {
             let e = ApiError::Internal("no adapter".into());
-            return err_response(&state, Some(&job), &path, request_bytes, &e, started, "no_adapter");
+            return err_response(&state, Some(&job), &path, request_bytes, &e, started, "no_adapter").await;
         }
     };
     if !adapter.forwards(&path) {
         let e = ApiError::Forbidden("path not forwardable".into());
-        return err_response(&state, Some(&job), &path, request_bytes, &e, started, "path_not_allowed");
+        return err_response(&state, Some(&job), &path, request_bytes, &e, started, "path_not_allowed").await;
     }
 
     // ---- Body policy: size + secret scan (blocking), injection markers (advisory) ----
@@ -79,7 +78,7 @@ pub async fn proxy(
         crate::policy::BodyVerdict::Blocked(reason) => {
             state.metrics.blocked_total.with_label_values(&[reason]).inc();
             let e = ApiError::Forbidden("blocked by policy".into());
-            return err_response(&state, Some(&job), &path, request_bytes, &e, started, reason);
+            return err_response(&state, Some(&job), &path, request_bytes, &e, started, reason).await;
         }
         crate::policy::BodyVerdict::Allowed => {}
     }
@@ -98,7 +97,7 @@ pub async fn proxy(
     // System prompt injection (chat-shaped bodies only).
     if let Some(jb) = json_body.as_mut() {
         if adapter.is_chat_body(&path) {
-            if let Some(prompt) = state.store.get_system_prompt(&job_id) {
+            if let Some(prompt) = state.store.get_system_prompt_async(job_id.clone()).await {
                 state.policy.inject_system_prompt(jb, &prompt);
             }
         }
@@ -106,28 +105,35 @@ pub async fn proxy(
     }
 
     // ---- Quotas ----
+    // Estimates use the *forwarded* body size (injected operator prompt
+    // included), not the original client body. Atomic reservation prevents
+    // concurrent calls from all spending the same remaining budget.
     let est = json_body
         .as_ref()
-        .map(|jb| preflight_estimate(request_bytes, jb))
+        .map(|jb| {
+            let fwd = serde_json::to_vec(jb).unwrap_or_default().len();
+            preflight_estimate(fwd, jb)
+        })
         .unwrap_or_else(|| estimate_tokens(request_bytes, 0));
-    if job.tokens_used.saturating_add(est) > job.max_tokens_total {
-        state.store.mark_status(&job_id, "exhausted", None);
+    if state.store.reserve_tokens_async(job_id.clone(), est).await.is_none() {
         let e = ApiError::RateLimited("token quota exhausted".into());
-        return err_response(&state, Some(&job), &path, request_bytes, &e, started, "token_cap");
+        return err_response(&state, Some(&job), &path, request_bytes, &e, started, "token_cap").await;
     }
-    if state.store.reserve_request(&job_id).is_none() {
+    if state.store.reserve_request_async(job_id.clone()).await.is_none() {
+        state.store.release_token_reservation_async(job_id.clone(), est).await;
         let e = ApiError::RateLimited("request quota exhausted".into());
-        return err_response(&state, Some(&job), &path, request_bytes, &e, started, "request_cap");
+        return err_response(&state, Some(&job), &path, request_bytes, &e, started, "request_cap").await;
     }
 
-    // ---- Concurrency bound ----
+    // ---- Concurrency bound (reject saturation immediately; never queue) ----
     let permit = match &state.gate {
-        Some(sem) => match sem.clone().acquire_owned().await {
+        Some(sem) => match sem.clone().try_acquire_owned() {
             Ok(p) => Some(p),
             Err(_) => {
-                state.store.release_request(&job_id);
+                state.store.release_request_async(job_id.clone()).await;
+                state.store.release_token_reservation_async(job_id.clone(), est).await;
                 let e = ApiError::Unavailable("saturated".into());
-                return err_response(&state, Some(&job), &path, request_bytes, &e, started, "saturated");
+                return err_response(&state, Some(&job), &path, request_bytes, &e, started, "saturated").await;
             }
         },
         None => None,
@@ -141,16 +147,26 @@ pub async fn proxy(
         method,
         headers,
         path.clone(),
+        uri.query().map(|q| format!("{path}?{q}")).unwrap_or(path),
         json_body,
         body,
         advisory,
         started,
         permit,
+        est,
     )
     .await;
 
     match result {
-        Ok(resp) => resp,
+        Ok((resp, buffered_done)) => {
+            if buffered_done {
+                // Buffered response: body fully transferred; balance the
+                // in-flight gauge here (streaming responses balance it in
+                // the stream's finalizer, including on client drop).
+                state.metrics.in_flight.dec();
+            }
+            resp
+        }
         Err(e) => {
             state.metrics.in_flight.dec();
             e
@@ -169,19 +185,21 @@ async fn forward(
     method: Method,
     headers: HeaderMap,
     path: String,
+    path_and_query: String,
     json_body: Option<Value>,
     raw_body: Bytes,
     advisory: bool,
     started: Instant,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
-) -> Result<Response, Response> {
+    est_tokens: u64,
+) -> Result<(Response, bool), Response> {
     let key = state
         .pool
         .get(&job.upstream_key_id)
         .map(|k| k.key.clone())
         .unwrap_or_default();
     let base = adapter.config().base_url.trim_end_matches('/').to_string();
-    let url = format!("{base}{path}");
+    let url = format!("{base}{path_and_query}");
 
     let mut req = state.upstream.request(method, &url);
     for (name, value) in headers.iter() {
@@ -213,14 +231,24 @@ async fn forward(
     let upstream_resp = match req.body(fwd_body).send().await {
         Ok(r) => r,
         Err(e) => {
-            // Failed before forwarding: release the reservation.
-            state.store.release_request(&job.job_id);
+            // Transport failure is ambiguous: the upstream may have accepted
+            // the body and burned the call (e.g. connection dropped while
+            // awaiting response headers). Only refund when the failure is
+            // proven to precede forwarding (connect-phase errors).
+            let is_connect_phase = e.is_connect() || e.is_builder();
+            if is_connect_phase {
+                state.store.release_request_async(job.job_id.clone()).await;
+                state.store.release_token_reservation_async(job.job_id.clone(), est_tokens).await;
+            } else {
+                state.store.consume_request_async(job.job_id.clone()).await;
+                state.store.release_token_reservation_async(job.job_id.clone(), est_tokens).await;
+            }
             let msg = e.to_string();
-            tracing::warn!(job_id = %job.job_id, path = %path, "upstream connect failed: {msg}");
-            state.store.log_request(&LogEntry {
-                job_id: &job.job_id,
+            tracing::warn!(job_id = %job.job_id, path = %path, "upstream forward failed: {msg}");
+            state.store.log_request_async(LogEntry {
+                job_id: job.job_id.clone(),
                 ts: Utc::now(),
-                path: &path,
+                path: path.clone(),
                 model: model_of(json_body.as_ref()),
                 request_bytes: raw_body.len(),
                 response_bytes: 0,
@@ -229,12 +257,15 @@ async fn forward(
                 prompt_tokens: None,
                 completion_tokens: None,
                 tokens_estimated: false,
-                policy_verdict: "upstream_connect_failed",
+                policy_verdict: "upstream_forward_failed".into(),
                 block_reason: None,
-            });
+            }).await;
             return Err(ApiError::Upstream(msg).into_response());
         }
     };
+
+    // Response headers received: the upstream call burned the request slot.
+    state.store.consume_request_async(job.job_id.clone()).await;
 
     let status = upstream_resp.status();
     if status.is_server_error() {
@@ -252,6 +283,24 @@ async fn forward(
         .unwrap_or("application/json")
         .to_string();
     let is_stream = upstream_ct.contains("text/event-stream");
+    // Preserve end-to-end headers (notably Retry-After from upstream
+    // 429/503s); hop-by-hop headers never cross the proxy.
+    let e2e_headers: Vec<(String, String)> = upstream_resp
+        .headers()
+        .iter()
+        .filter_map(|(n, v)| {
+            let n = n.as_str().to_ascii_lowercase();
+            let hop = matches!(
+                n.as_str(),
+                "connection" | "transfer-encoding" | "keep-alive" | "proxy-authenticate" | "proxy-authorization" | "te" | "trailer" | "upgrade" | "content-length" | "content-encoding"
+            );
+            if hop {
+                None
+            } else {
+                v.to_str().ok().map(|v| (n, v.to_string()))
+            }
+        })
+        .collect();
 
     let request_bytes = raw_body.len();
     let finalize = {
@@ -262,18 +311,20 @@ async fn forward(
         let provider_id = job.provider_id.clone();
         let path = path.clone();
         let model = model_of(json_body.as_ref());
+        let fwd_bytes = json_body
+            .as_ref()
+            .map(|jb| serde_json::to_vec(jb).unwrap_or_default().len())
+            .unwrap_or(request_bytes);
+        let est = est_tokens;
         move |response_bytes: u64, usage: Option<Usage>| {
+            let state = state.clone();
             let (u, estimated) = match usage {
                 Some(u) if u.total() > 0 => (u, false),
                 _ => (
-                    Usage { prompt_tokens: estimate_tokens(request_bytes, response_bytes as usize), completion_tokens: 0 },
+                    Usage { prompt_tokens: estimate_tokens(fwd_bytes, response_bytes as usize), completion_tokens: 0 },
                     true,
                 ),
             };
-            let exhausted = state.store.add_tokens(&job_id, u.total());
-            if exhausted {
-                tracing::info!(job_id = %job_id, "job marked exhausted (token cap)");
-            }
             state
                 .metrics
                 .tokens_total
@@ -284,10 +335,16 @@ async fn forward(
                 .requests_total
                 .with_label_values(&[&job_id, &tenant_id, "allowed"])
                 .inc();
-            state.store.log_request(&LogEntry {
-                job_id: &job_id,
+            // Runs from stream Drop (sync) and from buffered completion
+            // (async): use the sync store API inside spawn_blocking via a
+            // dedicated runtime handle when available, else a fresh runtime.
+            let store = state.store.clone();
+            let job_id2 = job_id.clone();
+            let verdict = if advisory { "allowed_injection_flag" } else { "allowed" };
+            let entry = LogEntry {
+                job_id: job_id.clone(),
                 ts: Utc::now(),
-                path: &path,
+                path: path.clone(),
                 model,
                 request_bytes,
                 response_bytes: response_bytes as usize,
@@ -296,13 +353,35 @@ async fn forward(
                 prompt_tokens: Some(u.prompt_tokens),
                 completion_tokens: Some(u.completion_tokens),
                 tokens_estimated: estimated,
-                policy_verdict: if advisory { "allowed_injection_flag" } else { "allowed" },
+                policy_verdict: verdict.to_string(),
                 block_reason: None,
-            });
+            };
+            // Finalize may run from an async context (buffered completion)
+            // or from stream Drop (client disconnect). Both must offload the
+            // blocking SQLite work; Handle::try_current covers Drop-inside-
+            // runtime, and spawn_blocking panics outside a runtime, so gate
+            // on the handle explicitly. Fire-and-forget: reconciliation is
+            // idempotent and the audit row is best-effort on drop.
+            if let Ok(h) = tokio::runtime::Handle::try_current() {
+                h.spawn(async move {
+                    let exhausted = tokio::task::spawn_blocking(move || {
+                        let exhausted = store.reconcile_tokens(&job_id2, est, u.total());
+                        store.log_request(&entry);
+                        exhausted
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if exhausted {
+                        tracing::info!(job_id = %job_id, "job marked exhausted (token cap)");
+                    }
+                });
+            }
         }
     };
 
     if is_stream {
+        // Permit ownership transfers into the stream state: released on EOF,
+        // error, idle timeout, or drop (client disconnect).
         let stream = crate::stream_util::usage_stream(
             upstream_resp,
             adapter.clone(),
@@ -310,16 +389,20 @@ async fn forward(
             state.metrics.clone(),
             permit,
         );
-        let resp = Response::builder()
+        let mut builder = Response::builder()
             .status(StatusCode::from_u16(status_code).unwrap())
             .header("content-type", upstream_ct)
             .header("cache-control", "no-cache")
-            .header("x-accel-buffering", "no")
-            .body(Body::from_stream(stream))
-            .unwrap();
-        Ok(resp)
+            .header("x-accel-buffering", "no");
+        for (n, v) in &e2e_headers {
+            builder = builder.header(n.as_str(), v.as_str());
+        }
+        let resp = builder.body(Body::from_stream(stream)).unwrap();
+        Ok((resp, false))
     } else {
-        drop(permit);
+        // Buffered: hold the permit until the body is downloaded and
+        // finalized, then hand it back so the caller balances in_flight.
+        let _held = permit;
         // Buffered: read whole body, extract usage, finalize, respond.
         let body_bytes = match tokio::time::timeout(
             std::time::Duration::from_secs(600),
@@ -342,12 +425,20 @@ async fn forward(
             .ok()
             .and_then(|v| adapter.extract_usage_response(&v));
         finalize(n, usage);
-        let resp = Response::builder()
+        let mut builder = Response::builder()
             .status(StatusCode::from_u16(status_code).unwrap())
-            .header("content-type", upstream_ct)
-            .body(Body::from(body_bytes))
-            .unwrap();
-        Ok(resp)
+            .header("content-type", upstream_ct.clone());
+        for (n, v) in &e2e_headers {
+            builder = builder.header(n.as_str(), v.as_str());
+        }
+        // Documented retry guidance for upstream 5xx when absent.
+        if StatusCode::from_u16(status_code).unwrap().is_server_error()
+            && !e2e_headers.iter().any(|(n, _)| n == "retry-after")
+        {
+            builder = builder.header("retry-after", "5");
+        }
+        let resp = builder.body(Body::from(body_bytes)).unwrap();
+        Ok((resp, true))
     }
 }
 
@@ -357,7 +448,7 @@ fn model_of(body: Option<&Value>) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-fn err_response(
+async fn err_response(
     state: &SharedState,
     job: Option<&crate::config::JobPolicySnapshot>,
     path: &str,
@@ -380,10 +471,10 @@ fn err_response(
             .requests_total
             .with_label_values(&[&job.job_id, &job.tenant_id, verdict])
             .inc();
-        state.store.log_request(&LogEntry {
-            job_id: &job.job_id,
+        state.store.log_request_async(LogEntry {
+            job_id: job.job_id.clone(),
             ts: Utc::now(),
-            path,
+            path: path.to_string(),
             model: None,
             request_bytes,
             response_bytes: 0,
@@ -392,9 +483,9 @@ fn err_response(
             prompt_tokens: None,
             completion_tokens: None,
             tokens_estimated: false,
-            policy_verdict: verdict,
-            block_reason: Some(&reason),
-        });
+            policy_verdict: verdict.to_string(),
+            block_reason: Some(reason.clone()),
+        }).await;
     }
     (*e).clone().into_response()
 }

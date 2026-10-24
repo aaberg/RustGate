@@ -14,7 +14,7 @@ fn main() {
         )
         .init();
 
-    let cfg = Config::from_env().expect("configuration");
+    let cfg = Config::load().expect("configuration");
     let store = Store::open(&cfg.sqlite_path).expect("sqlite store");
     let pool = KeyPool::load(&cfg).unwrap_or_default();
     if pool.ids().is_empty() {
@@ -25,8 +25,9 @@ fn main() {
     let addr = format!("{}:{}", cfg.listen_addr, cfg.listen_port);
     tracing::info!(%addr, "rustgate listening");
 
-    // Periodic expiry sweep (auth path also sweeps lazily).
-    {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async move {
+        // Periodic expiry sweep (auth path also checks expiry lazily per job).
         let st = state.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -38,10 +39,7 @@ fn main() {
                 }
             }
         });
-    }
 
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(async move {
         if let (Some(cert), Some(key)) = (cfg.tls_cert_path.clone(), cfg.tls_key_path.clone()) {
             let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
                 .await
