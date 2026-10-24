@@ -16,6 +16,10 @@ fn main() {
 
     let cfg = Config::load().expect("configuration");
     let store = Store::open(&cfg.sqlite_path).expect("sqlite store");
+    let recovered = store.recover_orphaned_reservations();
+    if recovered > 0 {
+        tracing::info!(count = recovered, "recovered orphaned reservations from previous process");
+    }
     let pool = KeyPool::load(&cfg).unwrap_or_default();
     if pool.ids().is_empty() {
         tracing::warn!("no upstream keys loaded; job issuance will fail until a key pool is provided");

@@ -112,7 +112,7 @@ pub async fn proxy(
         .as_ref()
         .map(|jb| {
             let fwd = serde_json::to_vec(jb).unwrap_or_default().len();
-            preflight_estimate(fwd, jb)
+            preflight_estimate(fwd, jb, &path)
         })
         .unwrap_or_else(|| estimate_tokens(request_bytes, 0));
     if state.store.reserve_tokens_async(job_id.clone(), est).await.is_none() {
@@ -140,6 +140,17 @@ pub async fn proxy(
     };
     state.metrics.in_flight.inc();
 
+    // Cancellation-safe accounting guard: if the handler future is dropped
+    // while waiting for upstream headers (downstream cancellation), neither
+    // forward() branch runs. The guard settles conservatively on drop.
+    let mut guard = AccountingGuard {
+        state: Some(state.clone()),
+        job_id: job_id.clone(),
+        est_tokens: est,
+        forwarded: false,
+        settled: false,
+    };
+
     let result = forward(
         state.clone(),
         job.clone(),
@@ -154,8 +165,11 @@ pub async fn proxy(
         started,
         permit,
         est,
+        &mut guard,
     )
     .await;
+    // forward() completed (either branch): the guard must not fire.
+    guard.settled = true;
 
     match result {
         Ok((resp, buffered_done)) => {
@@ -192,6 +206,7 @@ async fn forward(
     started: Instant,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
     est_tokens: u64,
+    guard: &mut AccountingGuard,
 ) -> Result<(Response, bool), Response> {
     let key = state
         .pool
@@ -231,6 +246,8 @@ async fn forward(
     let upstream_resp = match req.body(fwd_body).send().await {
         Ok(r) => r,
         Err(e) => {
+            // The send() call definitively ran: the guard must not settle.
+            guard.forwarded = true;
             // Transport failure is ambiguous: the upstream may have accepted
             // the body and burned the call (e.g. connection dropped while
             // awaiting response headers). Only refund when the failure is
@@ -240,8 +257,17 @@ async fn forward(
                 state.store.release_request_async(job.job_id.clone()).await;
                 state.store.release_token_reservation_async(job.job_id.clone(), est_tokens).await;
             } else {
+                // Ambiguous: the upstream may have accepted the body and
+                // generated a completion before the transport failed. Consume
+                // the request slot AND charge the reserved token estimate
+                // (conservative; a cost guard must not under-count).
                 state.store.consume_request_async(job.job_id.clone()).await;
-                state.store.release_token_reservation_async(job.job_id.clone(), est_tokens).await;
+                let st = state.clone();
+                let jid = job.job_id.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    st.store.reconcile_tokens(&jid, est_tokens, est_tokens);
+                })
+                .await;
             }
             let msg = e.to_string();
             tracing::warn!(job_id = %job.job_id, path = %path, "upstream forward failed: {msg}");
@@ -264,7 +290,10 @@ async fn forward(
         }
     };
 
-    // Response headers received: the upstream call burned the request slot.
+    // Response headers received: the upstream call burned the request slot,
+    // and the request definitively reached the upstream (drop from here on
+    // is handled by the stream/buffered finalizers, not the guard).
+    guard.forwarded = true;
     state.store.consume_request_async(job.job_id.clone()).await;
 
     let status = upstream_resp.status();
@@ -292,7 +321,7 @@ async fn forward(
             let n = n.as_str().to_ascii_lowercase();
             let hop = matches!(
                 n.as_str(),
-                "connection" | "transfer-encoding" | "keep-alive" | "proxy-authenticate" | "proxy-authorization" | "te" | "trailer" | "upgrade" | "content-length" | "content-encoding"
+                "connection" | "transfer-encoding" | "keep-alive" | "proxy-authenticate" | "proxy-authorization" | "te" | "trailer" | "upgrade" | "content-length"
             );
             if hop {
                 None
@@ -400,31 +429,47 @@ async fn forward(
         let resp = builder.body(Body::from_stream(stream)).unwrap();
         Ok((resp, false))
     } else {
-        // Buffered: hold the permit until the body is downloaded and
-        // finalized, then hand it back so the caller balances in_flight.
-        let _held = permit;
-        // Buffered: read whole body, extract usage, finalize, respond.
-        let body_bytes = match tokio::time::timeout(
-            std::time::Duration::from_secs(600),
-            upstream_resp.bytes(),
-        )
-        .await
-        {
+        // Buffered: the download + finalize run in a spawned task that owns
+        // the in-flight balance and the permit, so a downstream cancellation
+        // (dropping this handler future mid-download) cannot leak either:
+        // the task completes, finalizes, and decrements regardless.
+        let adapter2 = adapter.clone();
+        let metrics = state.metrics.clone();
+        let dl = tokio::spawn(async move {
+            let res = match tokio::time::timeout(
+                std::time::Duration::from_secs(600),
+                upstream_resp.bytes(),
+            )
+            .await
+            {
+                Ok(Ok(b)) => Ok(b),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err("upstream read timeout".to_string()),
+            };
+            match res {
+                Ok(b) => {
+                    let n = b.len() as u64;
+                    let usage = serde_json::from_slice::<Value>(&b)
+                        .ok()
+                        .and_then(|v| adapter2.extract_usage_response(&v));
+                    finalize(n, usage);
+                    metrics.in_flight.dec();
+                    drop(permit);
+                    Ok(b)
+                }
+                Err(msg) => {
+                    finalize(0, None);
+                    metrics.in_flight.dec();
+                    drop(permit);
+                    Err(msg)
+                }
+            }
+        });
+        let body_bytes = match dl.await {
             Ok(Ok(b)) => b,
-            Ok(Err(e)) => {
-                finalize(0, None);
-                return Err(ApiError::Upstream(e.to_string()).into_response());
-            }
-            Err(_) => {
-                finalize(0, None);
-                return Err(ApiError::Upstream("upstream read timeout".into()).into_response());
-            }
+            Ok(Err(msg)) => return Err(ApiError::Upstream(msg).into_response()),
+            Err(e) => return Err(ApiError::Internal(format!("download task: {e}")).into_response()),
         };
-        let n = body_bytes.len() as u64;
-        let usage = serde_json::from_slice::<Value>(&body_bytes)
-            .ok()
-            .and_then(|v| adapter.extract_usage_response(&v));
-        finalize(n, usage);
         let mut builder = Response::builder()
             .status(StatusCode::from_u16(status_code).unwrap())
             .header("content-type", upstream_ct.clone());
@@ -438,7 +483,9 @@ async fn forward(
             builder = builder.header("retry-after", "5");
         }
         let resp = builder.body(Body::from(body_bytes)).unwrap();
-        Ok((resp, true))
+        // The spawned download task already balanced in_flight and released
+        // the permit (including on cancellation), so the caller must not.
+        Ok((resp, false))
     }
 }
 
@@ -488,4 +535,41 @@ async fn err_response(
         }).await;
     }
     (*e).clone().into_response()
+}
+
+/// Cancellation-safe accounting for the reservation window between quota
+/// reservation and upstream response (or failure). If the handler future is
+/// dropped mid-window (downstream cancellation), the guard settles
+/// conservatively: consume the request slot (the body may have been sent)
+/// and charge the reserved token estimate. Idempotent with the normal paths.
+struct AccountingGuard {
+    state: Option<SharedState>,
+    job_id: String,
+    est_tokens: u64,
+    forwarded: bool,
+    settled: bool,
+}
+
+impl Drop for AccountingGuard {
+    fn drop(&mut self) {
+        if self.settled || self.forwarded || self.state.is_none() {
+            return;
+        }
+        let state = self.state.take().unwrap();
+        let job_id = self.job_id.clone();
+        let est = self.est_tokens;
+        // Fire-and-forget on drop: cannot await; use Handle::try_current
+        // and let the reconciliation run as a spawned task.
+        if let Ok(h) = tokio::runtime::Handle::try_current() {
+            h.spawn(async move {
+                state.store.consume_request_async(job_id.clone()).await;
+                let st = state.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    st.store.reconcile_tokens(&job_id, est, est);
+                })
+                .await;
+                state.metrics.in_flight.dec();
+            });
+        }
+    }
 }

@@ -135,6 +135,8 @@ System-prompt injection applies only to `/v1/chat/completions` bodies with a `me
 ### 6. Status transitions
 `revoked`, `done`, `expired`, `exhausted` are all terminal; none reversible. Re-opening requires a new job_id (same tenant/key bindings). Expiry is checked lazily at auth time plus a 30s periodic sweep. Quota exhaustion returns **429** consistently (including subsequent requests against an exhausted job); revoked/expired/done return 401.
 
+Exhaustion by reservation is *provisional*: any refund or reconciliation re-checks both quotas and reactivates jobs that still have headroom (so a fresh job sent an oversized `max_tokens` is rejected, not exhausted, and connect-failure refunds can't strand a job with zero consumed calls). `revoke`/`done` are accepted from the `exhausted` state so cancellation always wins over provisional exhaustion. On startup, orphaned reservations from a previous process are settled (released) and affected jobs re-evaluated. Estimates are per-choice (`n` multiplies the declared completion limit) and input-only for `/v1/embeddings`; the pre-flight gate and all refunds are cancellation-safe (drop guards + spawned finalizers).
+
 ### 7. Per-tenant risk score
 Deferred. The prompt-injection marker scan logs an advisory flag (`policy_verdict = allowed_injection_flag`) per request with tenant_id — that is the risk-score input. A score can be computed later from `request_log` with SQL, no schema change.
 

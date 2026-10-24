@@ -107,7 +107,10 @@ fn finish(s: &mut StreamState) {
     if let Some(f) = s.finalize.take() {
         f(s.total, s.usage.take());
     }
-    if let Some(m) = &s.metrics {
+    // Take (not borrow) metrics and permit so finish is idempotent: it can
+    // run once on EOF/error/timeout and again in Drop without double-
+    // decrementing the gauge or double-releasing the permit.
+    if let Some(m) = s.metrics.take() {
         m.in_flight.dec();
     }
     s.permit.take();

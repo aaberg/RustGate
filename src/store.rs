@@ -31,6 +31,31 @@ impl Store {
         Ok(store)
     }
 
+    /// Recover orphaned reservations from a previous process: in-flight
+    /// requests died with it, so their finalizers will never run.
+    pub fn recover_orphaned_reservations(&self) -> usize {
+        let conn = self.0.lock().unwrap();
+        let n = conn
+            .execute("UPDATE jobs SET pending_requests = 0, tokens_reserved = 0 WHERE pending_requests > 0 OR tokens_reserved > 0", [])
+            .map_err(StoreError::Sql)
+            .unwrap_or(0);
+        let ids: Vec<String> = {
+            let mut stmt = match conn.prepare("SELECT job_id FROM jobs WHERE status = 'exhausted'") {
+                Ok(s) => s,
+                Err(_) => return n,
+            };
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0));
+            match rows {
+                Ok(rows) => rows.filter_map(Result::ok).collect(),
+                Err(_) => Vec::new(),
+            }
+        };
+        for id in ids {
+            self.reactivate_if_budget(&conn, &id);
+        }
+        n
+    }
+
     fn migrate(&self) -> Result<(), StoreError> {
         let conn = self.0.lock().unwrap();
         conn.execute_batch(
@@ -187,10 +212,7 @@ impl Store {
             "UPDATE jobs SET pending_requests = MAX(pending_requests - 1, 0) WHERE job_id = ?1",
             params![job_id],
         );
-        let _ = conn.execute(
-            "UPDATE jobs SET status = 'active' WHERE job_id = ?1 AND status = 'exhausted' AND requests_used + pending_requests < max_requests AND tokens_used + tokens_reserved < max_tokens_total",
-            params![job_id],
-        );
+        self.reactivate_if_budget(&conn, job_id);
     }
 
     /// Atomically reserve estimated tokens before forwarding. Fails when the
@@ -207,8 +229,11 @@ impl Store {
         if n == 1 {
             Some(())
         } else {
+            // A failed estimate does NOT prove the budget is spent (a fresh
+            // job sent an oversized max_tokens is not exhausted). Only mark
+            // exhausted when consumed usage has actually reached the cap.
             let _ = conn.execute(
-                "UPDATE jobs SET status = 'exhausted' WHERE job_id = ?1 AND status = 'active'",
+                "UPDATE jobs SET status = 'exhausted' WHERE job_id = ?1 AND status = 'active' AND tokens_used >= max_tokens_total",
                 params![job_id],
             );
             None
@@ -216,11 +241,23 @@ impl Store {
     }
 
     /// Release a token reservation when the proxy failed before forwarding.
+    /// Reconsiders provisional exhaustion: with all reservations released
+    /// and remaining budget, an exhausted-marked job becomes active again.
     pub fn release_token_reservation(&self, job_id: &str, est_tokens: u64) {
         let conn = self.0.lock().unwrap();
         let _ = conn.execute(
             "UPDATE jobs SET tokens_reserved = MAX(tokens_reserved - ?2, 0) WHERE job_id = ?1",
             params![job_id, est_tokens],
+        );
+        self.reactivate_if_budget(&conn, job_id);
+    }
+
+    /// Shared reactivation check: expired jobs stay terminal; exhausted jobs
+    /// with remaining request and token headroom become active.
+    fn reactivate_if_budget(&self, conn: &rusqlite::Connection, job_id: &str) {
+        let _ = conn.execute(
+            "UPDATE jobs SET status = 'active' WHERE job_id = ?1 AND status = 'exhausted' AND requests_used + pending_requests < max_requests AND tokens_used + tokens_reserved < max_tokens_total AND expires_at > ?2",
+            params![job_id, Utc::now().to_rfc3339()],
         );
     }
 
@@ -242,11 +279,7 @@ impl Store {
             .map_err(StoreError::Sql)
             .unwrap_or(0) == 1;
         if !exhausted {
-            // Re-estimate after reconciliation: budget may remain.
-            let _ = conn.execute(
-                "UPDATE jobs SET status = 'active' WHERE job_id = ?1 AND status = 'exhausted' AND tokens_used + tokens_reserved < max_tokens_total AND expires_at > ?2",
-                params![job_id, Utc::now().to_rfc3339()],
-            );
+            self.reactivate_if_budget(&conn, job_id);
         }
         exhausted
     }
@@ -282,7 +315,7 @@ impl Store {
                 "UPDATE jobs SET status = ?2,
                  revoked_at = CASE WHEN ?2 IN ('revoked','done') THEN ?4 ELSE revoked_at END,
                  revoked_reason = CASE WHEN ?2 = 'revoked' THEN ?3 ELSE revoked_reason END
-                 WHERE job_id = ?1 AND status = 'active'",
+                 WHERE job_id = ?1 AND status IN ('active', 'exhausted')",
                 params![job_id, status, reason, now],
             )
             .map_err(StoreError::Sql)
@@ -572,6 +605,83 @@ mod tests {
         assert_eq!(snap(&s, "j").tokens_used, 10);
         // The second call now fits again.
         assert!(s.reserve_tokens("j", 60).is_some());
+    }
+
+    #[test]
+    fn oversized_estimate_does_not_exhaust_fresh_job() {
+        let s = Store::open_memory().unwrap();
+        s.create_job(&NewJob {
+            job_id: "j".into(),
+            tenant_id: "t".into(),
+            provider_id: "mistral".into(),
+            upstream_key_id: "k".into(),
+            token_hash: "h".into(),
+            system_prompt: None,
+            created_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::minutes(30),
+            max_requests: 10,
+            max_tokens_total: 10_000,
+            status: "active".into(),
+        })
+        .unwrap();
+        // max_tokens: 20000 on a fresh 10k job: rejected, NOT exhausted —
+        // retrying with a smaller limit must work.
+        assert!(s.reserve_tokens("j", 20_000).is_none());
+        assert_eq!(snap(&s, "j").status, "active");
+        assert!(s.reserve_tokens("j", 100).is_some());
+    }
+
+    #[test]
+    fn revoke_allowed_from_exhausted() {
+        let s = Store::open_memory().unwrap();
+        s.create_job(&NewJob {
+            job_id: "j".into(),
+            tenant_id: "t".into(),
+            provider_id: "mistral".into(),
+            upstream_key_id: "k".into(),
+            token_hash: "h".into(),
+            system_prompt: None,
+            created_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::minutes(30),
+            max_requests: 1,
+            max_tokens_total: 100,
+            status: "active".into(),
+        })
+        .unwrap();
+        assert!(s.reserve_request("j").is_some());
+        assert!(s.reserve_request("j").is_none());
+        assert_eq!(snap(&s, "j").status, "exhausted");
+        // Cancellation must win over provisional exhaustion.
+        assert!(s.mark_status("j", "revoked", Some("cancelled")));
+        assert_eq!(snap(&s, "j").status, "revoked");
+    }
+
+    #[test]
+    fn token_refund_reactivates_after_request_refund() {
+        let s = Store::open_memory().unwrap();
+        s.create_job(&NewJob {
+            job_id: "j".into(),
+            tenant_id: "t".into(),
+            provider_id: "mistral".into(),
+            upstream_key_id: "k".into(),
+            token_hash: "h".into(),
+            system_prompt: None,
+            created_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::minutes(30),
+            max_requests: 1,
+            max_tokens_total: 100,
+            status: "active".into(),
+        })
+        .unwrap();
+        // Exhausted by request-slot pressure with all tokens still reserved.
+        assert!(s.reserve_request("j").is_some());
+        assert!(s.reserve_tokens("j", 100).is_some());
+        assert!(s.reserve_request("j").is_none());
+        assert_eq!(snap(&s, "j").status, "exhausted");
+        // Refund order must not matter: release either order reactivates.
+        s.release_token_reservation("j", 100);
+        s.release_request("j");
+        assert_eq!(snap(&s, "j").status, "active");
     }
 
     #[test]

@@ -116,6 +116,7 @@ async fn start_proxy(upstream_base: &str, max_requests: u64, max_tokens: u64, tt
         allow_insecure: true,
         tls_cert_path: None,
         tls_key_path: None,
+        public_base_url: None,
     };
     let pool = KeyPool::load_env_for_test("mistral", "sk-upstream-real-key");
     let state = Arc::new(AppState::build(cfg, store, pool));

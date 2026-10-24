@@ -28,6 +28,10 @@ pub struct Config {
     pub providers: HashMap<String, ProviderConfig>,
     /// If true, data plane may serve plain HTTP (dev only).
     pub allow_insecure: bool,
+    /// Public/advertised base URL for issuance responses, e.g.
+    /// "https://proxy.internal:8443/v1". When unset, derived from the
+    /// listener (which may not be client-reachable, e.g. 0.0.0.0 binds).
+    pub public_base_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -95,6 +99,7 @@ impl Default for Config {
             max_in_flight: 0,
             providers,
             allow_insecure: false,
+            public_base_url: None,
         }
     }
 }
@@ -105,9 +110,9 @@ impl Config {
     pub fn from_file(path: &PathBuf) -> Result<Self, ConfigError> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| ConfigError::Io(format!("read {path:?}: {e}")))?;
-        let cfg: Config = serde_json::from_str(&raw).map_err(ConfigError::Parse)?;
-        cfg.validate()?;
-        Ok(cfg)
+        // No validation here: RUSTGATE_* env overrides (e.g. TLS paths)
+        // are applied on top before the merged config is validated.
+        serde_json::from_str(&raw).map_err(ConfigError::Parse)
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -189,13 +194,24 @@ impl Config {
         if let Ok(v) = std::env::var("RUSTGATE_TLS_KEY") {
             self.tls_key_path = Some(PathBuf::from(v));
         }
-        if let Ok(_) = std::env::var("RUSTGATE_ALLOW_INSECURE") {
-            self.allow_insecure = true;
+        if let Ok(v) = std::env::var("RUSTGATE_ALLOW_INSECURE") {
+            match v.to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => self.allow_insecure = true,
+                "0" | "false" | "no" | "off" | "" => {}
+                other => {
+                    return Err(ConfigError::Validation(format!(
+                        "RUSTGATE_ALLOW_INSECURE: unrecognized value {other:?} (expected 1/true or 0/false)"
+                    )))
+                }
+            }
         }
         if let Ok(v) = std::env::var("RUSTGATE_UPSTREAM_BASE_URL") {
             if let Some(p) = self.providers.get_mut("mistral") {
                 p.base_url = v;
             }
+        }
+        if let Ok(v) = std::env::var("RUSTGATE_PUBLIC_BASE_URL") {
+            self.public_base_url = Some(v.trim_end_matches('/').to_string());
         }
         if let Ok(v) = std::env::var("RUSTGATE_CONTROL_TOKEN_FILE") {
             self.control_token = Some(

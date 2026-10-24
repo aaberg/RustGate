@@ -32,7 +32,7 @@ export RUSTGATE_KEY_MISTRAL_MAIN='mistral:sk-your-real-key'
 
 # 2. control-plane token + dev HTTP mode
 export RUSTGATE_CONTROL_TOKEN='dev-control-token'
-export RUSTGATE_ALLOW_INSECURE=1
+export RUSTGATE_ALLOW_INSECURE=1  # must be 1/true — "0"/"false" stay secure
 export RUSTGATE_LISTEN_PORT=8080
 
 ./target/debug/rustgate
@@ -89,6 +89,8 @@ TLS is required in production (dev plain HTTP needs `RUSTGATE_ALLOW_INSECURE=1`)
 | `RUSTGATE_CONTROL_TOKEN` (or `RUSTGATE_CONTROL_TOKEN_FILE`) | Control-plane bearer token | none |
 | `RUSTGATE_KEY_<ID>` | Upstream key, `provider:sk-...` (dev fallback) | — |
 | `RUSTGATE_UPSTREAM_BASE_URL` | Overrides the `mistral` provider base URL | `https://api.mistral.ai` |
+| `RUSTGATE_PUBLIC_BASE_URL` | Advertised proxy URL in issuance responses (use when the bind address isn't client-reachable, e.g. `0.0.0.0`, or behind a reverse proxy) | derived from listener |
+| `RUSTGATE_CONFIG` | Path to a JSON config file (providers, allowlists, quota defaults, `max_in_flight`); env vars override on top | — |
 
 ### Key pool file
 
