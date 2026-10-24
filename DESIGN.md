@@ -105,3 +105,60 @@ Order of checks on every proxied request:
  * System-prompt injection: request without the operator system message gets it prepended; with it, no duplicate.
  * Streaming: SSE response streams incrementally end-to-end.
  * Path allowlist rejects /v1/admin style paths.
+
+## Decisions (implementation addendum)
+
+Decisions made during implementation review, binding for v1:
+
+### 1. Token accounting for streams
+Three-tier, in priority order:
+1. Upstream-reported usage (the adapter injects `stream_options.include_usage` on streamed chats for OpenAI-compatible upstreams, and sniffs the final SSE `data:` chunk for a `usage` object).
+2. If a stream ends without usage (disconnect, mid-stream error, idle timeout): estimate `request_bytes/4 + response_bytes/4 + 16` and set `tokens_estimated = 1` on the log row. A cost guard must not under-count.
+3. Never count nothing.
+
+The token cap is enforced pre-flight as a gate (`tokens_used + preflight_estimate > max_tokens_total` → 429 + mark exhausted; the estimate prefers the request's declared `max_tokens`) and post-hoc as an increment on completion. The cap can therefore be exceeded by at most one in-flight request's estimate — accepted slack.
+
+### 2. Reservation semantics
+- `requests_used` is incremented atomically before forwarding via `UPDATE ... WHERE requests_used < max_requests` (rows-affected = reservation). This holds the cap under concurrency without a reservation table.
+- Tokens use the pre-flight gate only (see 1); no token reservation.
+- The request reservation is released only when the proxy fails *before* forwarding (upstream connect error). A burned upstream call is a burned call.
+
+### 3. Control-plane auth
+`POST /v1/jobs`, `/revoke`, `/done` all require the same control-plane credential: a shared static bearer token (constant-time compared) or mTLS-terminated connection. Under the shared-token model, `/revoke` additionally verifies `tenant_id` in the body matches the job's tenant, so one tenant's builder cannot revoke another's job. A distinct admin credential (revoking any tenant's job) is a config-time role decision deferred to v2; v1 treats the control token as the admin credential.
+
+### 4. Secrets file format
+One entry per line: `key_id = { "provider": "...", "key": "..." }` (inline JSON) or compact `key_id = provider:sk-...`. `#` comments. Startup warns if the file is group/world readable; expected mode 0600. Env fallback: `RUSTGATE_KEY_<ID>=provider:key` for dev. Issuance referencing an unknown `upstream_key_id` fails loudly (400).
+
+### 5. Injection scope
+System-prompt injection applies only to `/v1/chat/completions` bodies with a `messages` array. `/v1/embeddings` and `/v1/models` are forwarded untouched (after auth/quota/secret-scan). The sentinel check is a substring match on any system message; the injected prompt is inserted as the first system message, before any container-supplied system message.
+
+### 6. Status transitions
+`revoked`, `done`, `expired`, `exhausted` are all terminal; none reversible. Re-opening requires a new job_id (same tenant/key bindings). Expiry is checked lazily at auth time plus a 30s periodic sweep. Quota exhaustion returns **429** consistently (including subsequent requests against an exhausted job); revoked/expired/done return 401.
+
+### 7. Per-tenant risk score
+Deferred. The prompt-injection marker scan logs an advisory flag (`policy_verdict = allowed_injection_flag`) per request with tenant_id — that is the risk-score input. A score can be computed later from `request_log` with SQL, no schema change.
+
+### 8. Provider-agnostic adapter seam
+The client-facing protocol is fixed at the OpenAI-compatible shape; providers plug in via a `ProviderAdapter` trait (`id`, `forwards`, `auth_header`, `transform_request`, `extract_usage_*`, `is_chat_body`). v1 ships the `OpenAICompatible` adapter (Mistral, Groq, vLLM, OpenRouter, OpenAI, ...). Non-compatible providers (Anthropic) get a translating adapter later — contained, no proxy rewrite. Key pool entries carry `provider`; the jobs table stores `provider_id` explicitly; base URL, allowlist, and secret-scan patterns are per-provider config. No multi-provider routing in v1: one job → one key → one provider.
+
+### 9. Job self-inspection
+`GET /v1/job/me` (job-token authenticated) returns status and quota usage, so harnesses can surface remaining budget. Exposed on the data plane because it leaks nothing the container doesn't already hold.
+
+### 10. Stack
+axum 0.8 + tokio, reqwest (rustls) upstream client, rusqlite (bundled SQLite, WAL, synchronous = NORMAL, busy_timeout 5s, single connection behind a mutex via spawn_blocking-compatible access), tracing JSON logs, prometheus metrics. TLS via rustls when cert paths are configured; plain-HTTP dev mode requires explicit `allow_insecure`.
+
+## Implementation map
+
+- `src/config.rs` — env/config-file loading, per-provider settings, quota defaults/caps
+- `src/secrets.rs` — key pool loading (secrets file / env), file-format above
+- `src/store.rs` — SQLite schema (jobs, request_log), atomic quota reservation, status transitions, sweeps
+- `src/adapters.rs` — `ProviderAdapter` trait, `OpenAICompatible` adapter, registry
+- `src/policy.rs` — size cap, secret scan, advisory injection-marker scan, system-prompt injection with sentinel
+- `src/proxy.rs` — data-plane handler: auth → state → allowlist → policy → quotas → forward; streaming/buffered paths, token reconciliation
+- `src/stream_util.rs` — pass-through SSE stream: immediate flush, usage sniffing, byte counting, idle timeout, finalize-once
+- `src/control.rs` — job issue/revoke/done, control-plane auth
+- `src/router.rs` — routes: /healthz, /metrics, /v1/jobs*, /v1/job/me, data-plane fallback
+- `src/usage.rs` — token estimation constants and pre-flight estimate
+- `src/metrics.rs` — Prometheus registry: requests by verdict, blocked by reason, tokens by key/provider, in-flight, upstream errors
+- `src/error.rs` — API error → status mapping; generic data-plane messages
+- `tests/integration.rs` — the acceptance criteria, end-to-end against a mock upstream
