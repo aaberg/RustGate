@@ -38,6 +38,10 @@ impl AppState {
         let upstream = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(600))
+            // Never follow redirects automatically: a 307/308 would carry
+            // the real Authorization header (and body) to a target the path
+            // allowlist never validated. Redirects pass through to the client.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("upstream client");
         let gate = if cfg.max_in_flight > 0 {

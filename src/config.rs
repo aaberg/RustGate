@@ -197,7 +197,7 @@ impl Config {
         if let Ok(v) = std::env::var("RUSTGATE_ALLOW_INSECURE") {
             match v.to_ascii_lowercase().as_str() {
                 "1" | "true" | "yes" | "on" => self.allow_insecure = true,
-                "0" | "false" | "no" | "off" | "" => {}
+                "0" | "false" | "no" | "off" | "" => self.allow_insecure = false,
                 other => {
                     return Err(ConfigError::Validation(format!(
                         "RUSTGATE_ALLOW_INSECURE: unrecognized value {other:?} (expected 1/true or 0/false)"

@@ -408,6 +408,27 @@ async fn forward(
         }
     };
 
+    // Failure finalize for the buffered path: charges the reserved token
+    // estimate (the upstream may have completed the generation) and writes
+    // the audit row with estimated usage.
+    let finalize_failure = {
+        let state = state.clone();
+        let job_id = job.job_id.clone();
+        let est = est_tokens;
+        move || {
+            // Charge the reserved estimate: the upstream may have completed
+            // the generation before the truncation/timeout.
+            if let Ok(h) = tokio::runtime::Handle::try_current() {
+                h.spawn(async move {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        state.store.reconcile_tokens(&job_id, est, est);
+                    })
+                    .await;
+                });
+            }
+        }
+    };
+
     if is_stream {
         // Permit ownership transfers into the stream state: released on EOF,
         // error, idle timeout, or drop (client disconnect).
@@ -435,6 +456,7 @@ async fn forward(
         // the task completes, finalizes, and decrements regardless.
         let adapter2 = adapter.clone();
         let metrics = state.metrics.clone();
+        let finalize_failure = finalize_failure;
         let dl = tokio::spawn(async move {
             let res = match tokio::time::timeout(
                 std::time::Duration::from_secs(600),
@@ -458,7 +480,11 @@ async fn forward(
                     Ok(b)
                 }
                 Err(msg) => {
-                    finalize(0, None);
+                    // Incomplete buffered response: the upstream may have
+                    // burned the full generation before the truncation or
+                    // timeout. Charge the reserved estimate (conservative)
+                    // instead of refunding it; usage is marked estimated.
+                    finalize_failure();
                     metrics.in_flight.dec();
                     drop(permit);
                     Err(msg)
@@ -467,8 +493,19 @@ async fn forward(
         });
         let body_bytes = match dl.await {
             Ok(Ok(b)) => b,
-            Ok(Err(msg)) => return Err(ApiError::Upstream(msg).into_response()),
-            Err(e) => return Err(ApiError::Internal(format!("download task: {e}")).into_response()),
+            // The task already balanced in_flight and released the permit
+            // (including for failures); the error path must NOT decrement
+            // again in the outer handler — hence Ok(Err) is returned as a
+            // normal response, not an Err that triggers the outer dec.
+            Ok(Err(msg)) => {
+                let e = ApiError::Upstream(msg);
+                return Ok((e.into_response(), false));
+            }
+            Err(e) => {
+                // Join error (task panicked/cancelled): the task may not
+                // have balanced. Let the outer handler handle the gauge.
+                return Err(ApiError::Internal(format!("download task: {e}")).into_response());
+            }
         };
         let mut builder = Response::builder()
             .status(StatusCode::from_u16(status_code).unwrap())
