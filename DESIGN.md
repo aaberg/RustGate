@@ -105,3 +105,62 @@ Order of checks on every proxied request:
  * System-prompt injection: request without the operator system message gets it prepended; with it, no duplicate.
  * Streaming: SSE response streams incrementally end-to-end.
  * Path allowlist rejects /v1/admin style paths.
+
+## Decisions (implementation addendum)
+
+Decisions made during implementation review, binding for v1:
+
+### 1. Token accounting for streams
+Three-tier, in priority order:
+1. Upstream-reported usage (the adapter injects `stream_options.include_usage` on streamed chats for OpenAI-compatible upstreams, and sniffs the final SSE `data:` chunk for a `usage` object).
+2. If a stream ends without usage (disconnect, mid-stream error, idle timeout): estimate `request_bytes/4 + response_bytes/4 + 16` and set `tokens_estimated = 1` on the log row. A cost guard must not under-count.
+3. Never count nothing.
+
+The token cap is enforced by an **atomic reservation** before forwarding (`tokens_reserved += est WHERE tokens_used + tokens_reserved + est <= max_tokens_total`), reconciled to actual usage on completion. Estimates use the *forwarded* body size (injected operator prompt included) and prefer the request's declared completion limit (`max_completion_tokens`, then legacy `max_tokens`; saturating arithmetic), applying a conservative default completion allowance when neither is declared. Concurrent calls can no longer spend the same remaining budget; the reservation is provisional, so reconciliation reactivates a job that was marked exhausted by an over-large estimate when actual usage leaves budget.
+
+### 2. Reservation semantics
+- Requests are reserved atomically before forwarding via `pending_requests` (`UPDATE ... WHERE requests_used + pending_requests < max_requests`); the reservation converts to `requests_used` when upstream response headers arrive (the call burned). Pending and consumed are tracked separately so a connect-failure refund cannot strand the job terminally exhausted with zero burned calls; refunds reactivate jobs exhausted only by pending pressure.
+- Tokens use an atomic reservation (see 1), not just a snapshot gate.
+- Reservations are released only for failures proven to precede forwarding (connect/builder-phase errors). Ambiguous transport failures (body possibly accepted upstream) consume the slot — a burned upstream call is a burned call.
+
+### 3. Control-plane auth
+`POST /v1/jobs`, `/revoke`, `/done` all require the same control-plane credential: a shared static bearer token (constant-time compared) or mTLS-terminated connection. Under the shared-token model, `/revoke` additionally verifies `tenant_id` in the body matches the job's tenant, so one tenant's builder cannot revoke another's job. A distinct admin credential (revoking any tenant's job) is a config-time role decision deferred to v2; v1 treats the control token as the admin credential.
+
+### 4. Secrets file format
+One entry per line: `key_id = { "provider": "...", "key": "..." }` (inline JSON) or compact `key_id = provider:sk-...`. `#` comments. Startup warns if the file is group/world readable; expected mode 0600. Env fallback: `RUSTGATE_KEY_<ID>=provider:key` for dev. Issuance referencing an unknown `upstream_key_id` fails loudly (400).
+
+### 5. Injection scope
+System-prompt injection applies only to `/v1/chat/completions` bodies with a `messages` array. `/v1/embeddings` and `/v1/models` are forwarded untouched (after auth/quota/secret-scan). The sentinel check is a substring match on any system message; the injected prompt is inserted as the first system message, before any container-supplied system message.
+
+### 6. Status transitions
+`revoked`, `done`, `expired`, `exhausted` are all terminal; none reversible. Re-opening requires a new job_id (same tenant/key bindings). Expiry is checked lazily at auth time plus a 30s periodic sweep. Quota exhaustion returns **429** consistently (including subsequent requests against an exhausted job); revoked/expired/done return 401.
+
+Exhaustion by reservation is *provisional*: any refund or reconciliation re-checks both quotas and reactivates jobs that still have headroom (so a fresh job sent an oversized `max_tokens` is rejected, not exhausted, and connect-failure refunds can't strand a job with zero consumed calls). `revoke`/`done` are accepted from the `exhausted` state so cancellation always wins over provisional exhaustion. On startup, orphaned reservations from a previous process are settled (released) and affected jobs re-evaluated. Estimates are per-choice (`n` multiplies the declared completion limit) and input-only for `/v1/embeddings`; the pre-flight gate and all refunds are cancellation-safe (drop guards + spawned finalizers).
+
+### 7. Per-tenant risk score
+Deferred. The prompt-injection marker scan logs an advisory flag (`policy_verdict = allowed_injection_flag`) per request with tenant_id — that is the risk-score input. A score can be computed later from `request_log` with SQL, no schema change.
+
+### 8. Provider-agnostic adapter seam
+The client-facing protocol is fixed at the OpenAI-compatible shape; providers plug in via a `ProviderAdapter` trait (`id`, `forwards`, `auth_header`, `transform_request`, `extract_usage_*`, `is_chat_body`). v1 ships the `OpenAICompatible` adapter (Mistral, Groq, vLLM, OpenRouter, OpenAI, ...). Non-compatible providers (Anthropic) get a translating adapter later — contained, no proxy rewrite. Key pool entries carry `provider`; the jobs table stores `provider_id` explicitly; base URL, allowlist, and secret-scan patterns are per-provider config. No multi-provider routing in v1: one job → one key → one provider.
+
+### 9. Job self-inspection
+`GET /v1/job/me` (job-token authenticated) returns status and quota usage, so harnesses can surface remaining budget. Exposed on the data plane because it leaks nothing the container doesn't already hold.
+
+### 10. Stack
+axum 0.8 + tokio, reqwest (rustls) upstream client, rusqlite (bundled SQLite, WAL, synchronous = NORMAL, busy_timeout 5s, single connection behind a mutex via spawn_blocking-compatible access), tracing JSON logs, prometheus metrics. TLS via rustls when cert paths are configured; plain-HTTP dev mode requires explicit `allow_insecure`.
+
+## Implementation map
+
+- `src/config.rs` — env/config-file loading, per-provider settings, quota defaults/caps
+- `src/secrets.rs` — key pool loading (secrets file / env), file-format above
+- `src/store.rs` — SQLite schema (jobs, request_log), atomic quota reservation, status transitions, sweeps
+- `src/adapters.rs` — `ProviderAdapter` trait, `OpenAICompatible` adapter, registry
+- `src/policy.rs` — size cap, secret scan, advisory injection-marker scan, system-prompt injection with sentinel
+- `src/proxy.rs` — data-plane handler: auth → state → allowlist → policy → quotas → forward; streaming/buffered paths, token reconciliation
+- `src/stream_util.rs` — pass-through SSE stream: immediate flush, usage sniffing, byte counting, idle timeout, finalize-once
+- `src/control.rs` — job issue/revoke/done, control-plane auth
+- `src/router.rs` — routes: /healthz, /metrics, /v1/jobs*, /v1/job/me, data-plane fallback
+- `src/usage.rs` — token estimation constants and pre-flight estimate
+- `src/metrics.rs` — Prometheus registry: requests by verdict, blocked by reason, tokens by key/provider, in-flight, upstream errors
+- `src/error.rs` — API error → status mapping; generic data-plane messages
+- `tests/integration.rs` — the acceptance criteria, end-to-end against a mock upstream
