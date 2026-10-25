@@ -1,6 +1,9 @@
 use super::*;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use tokio::{net::TcpListener, task::JoinHandle};
+
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 
 struct Upstream {
     address: SocketAddr,
@@ -225,6 +228,60 @@ async fn non_streaming_json_and_exact_body_limit_are_enforced() {
     let captured = captures(mock).await;
     assert_eq!(captured[0]["body"], body);
     assert_eq!(captured.as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn compressed_upstream_completions_remain_decodable() {
+    // Repeated Content-Encoding fields describe successive coding layers.
+    // Exercise both ordinary gzip and a response requiring both header values.
+    for layers in [1, 2] {
+        let mut encoded = serde_json::to_vec(&json!({
+            "choices": [{"message": {"role": "assistant", "content": "Compressed completion"}}]
+        }))
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        for _ in 0..layers {
+            let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+            gzip.write_all(&encoded).unwrap();
+            encoded = gzip.finish().unwrap();
+            headers.append(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        }
+        let encoded = axum::body::Bytes::from(encoded);
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let headers = headers.clone();
+                let encoded = encoded.clone();
+                async move { (headers, encoded) }
+            }),
+        );
+        let (fixture, _upstream) = fixture(upstream, "").await;
+        let token = token(&fixture).await;
+        let response = fixture
+            .app
+            .oneshot(chat(chat_body().to_string(), Some(&token)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let (parts, body) = response.into_parts();
+        let mut decoded = to_bytes(body, MAX_BODY_BYTES).await.unwrap().to_vec();
+        // A consumer can only decompress layers identified by the response.
+        for encoding in parts.headers.get_all(header::CONTENT_ENCODING) {
+            assert_eq!(encoding, "gzip");
+            let mut output = Vec::new();
+            GzDecoder::new(decoded.as_slice())
+                .read_to_end(&mut output)
+                .unwrap();
+            decoded = output;
+        }
+        let completion: Value =
+            serde_json::from_slice(&decoded).expect("completion must decode as JSON");
+        assert_eq!(
+            completion["choices"][0]["message"]["content"],
+            "Compressed completion"
+        );
+    }
 }
 
 #[tokio::test]

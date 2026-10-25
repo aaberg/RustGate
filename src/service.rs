@@ -231,9 +231,13 @@ async fn proxy_chat(State(state): State<Arc<ServiceState>>, request: Request) ->
     };
     let status = response.status();
     let mut headers = HeaderMap::new();
-    for name in [header::CONTENT_TYPE, header::RETRY_AFTER] {
-        if let Some(value) = response.headers().get(&name) {
-            headers.insert(name, value.clone());
+    for name in [
+        header::CONTENT_TYPE,
+        header::CONTENT_ENCODING,
+        header::RETRY_AFTER,
+    ] {
+        for value in response.headers().get_all(&name) {
+            headers.append(name.clone(), value.clone());
         }
     }
     let body = match response.bytes().await {
