@@ -17,6 +17,7 @@ pub fn check_control_auth(headers: &HeaderMap, state: &SharedState) -> Result<()
         .cfg
         .control_token
         .as_deref()
+        .filter(|token| !token.trim().is_empty())
         .ok_or(ApiError::Unauthorized)?;
     let got = headers
         .get("authorization")
