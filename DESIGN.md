@@ -105,3 +105,73 @@ Order of checks on every proxied request:
  * System-prompt injection: request without the operator system message gets it prepended; with it, no duplicate.
  * Streaming: SSE response streams incrementally end-to-end.
  * Path allowlist rejects /v1/admin style paths.
+
+## Step 1: local development service
+
+This increment implements startup configuration, health, graceful shutdown, and a separate mock upstream. It does **not** implement job issuance, persistence, authentication, or proxy forwarding. The upstream URL is validated but is not contacted by the service yet.
+
+Both executables serve plain HTTP on loopback only. Non-loopback bind addresses are rejected until TLS is implemented in step 2. Do not deploy this increment to build containers or expose the mock through a tunnel or reverse proxy.
+
+### Running
+
+With a stable Rust toolchain supporting edition 2024:
+
+```sh
+cargo run --bin rustgate
+curl http://127.0.0.1:8080/healthz
+# {"status":"ok"}
+
+# In another terminal:
+cargo run --bin mock-upstream
+```
+
+Both processes handle SIGINT (Ctrl-C) and, on Unix, SIGTERM by stopping new connections and finishing admitted requests before exiting. There is no forced drain deadline in this increment.
+
+### Configuration
+
+Service precedence is built-in defaults, then an optional TOML file selected by `RUSTGATE_CONFIG`, then individual environment overrides. See `rustgate.example.toml`. An explicitly selected missing or malformed file, unknown TOML field, or invalid setting fails startup.
+
+| TOML field | Environment override | Default |
+| --- | --- | --- |
+| `listen_addr` | `RUSTGATE_LISTEN_ADDR` | `127.0.0.1:8080` |
+| `upstream_base_url` | `RUSTGATE_UPSTREAM_BASE_URL` | `http://127.0.0.1:9090` |
+
+Listen addresses must be loopback IP socket addresses (not hostnames). Upstream URLs must use HTTPS, or HTTP with a loopback host, and must not contain credentials, a query, or a fragment. No upstream credentials are needed for step 1.
+
+```sh
+RUSTGATE_CONFIG=rustgate.example.toml cargo run --bin rustgate
+```
+
+### Local mock upstream
+
+`mock-upstream` binds `127.0.0.1:9090` by default; override with `RUSTGATE_MOCK_LISTEN_ADDR` (loopback IP socket address only). It also exposes `GET /healthz`. Port `0` selects an ephemeral port; both executables print their actual bound address.
+
+Send JSON to `POST /v1/chat/completions`. The fixed assistant reply is `Hello from mock.`, with usage of 5 prompt tokens, 3 completion tokens, and 8 total tokens.
+
+| Query control | Behavior |
+| --- | --- |
+| `mode=normal` (default) | Immediate JSON completion |
+| `mode=delayed` | JSON completion after `delay_ms` |
+| `mode=sse` | Immediate first SSE chunk, second chunk after `delay_ms`, then a usage chunk and `[DONE]` |
+| `mode=failure` | HTTP 503 with a structured error and `Retry-After: 1` |
+| `delay_ms` | Default 100; accepted range 0–10000 |
+
+```sh
+curl http://127.0.0.1:9090/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"mock-mistral","messages":[{"role":"user","content":"Hello"}]}'
+
+curl -N 'http://127.0.0.1:9090/v1/chat/completions?mode=sse&delay_ms=500' \
+  -H 'Content-Type: application/json' -d '{}'
+```
+
+`GET /__mock/requests` returns an array of captured requests with `method`, `path` (without query), `authorization` (or `null`), and parsed JSON `body`. `DELETE /__mock/requests` clears it and returns 204. Captures are in memory, isolated per fixture, and retain only the newest 100 requests. JSON request bodies are limited to 1 MiB; malformed JSON and invalid mode/delay controls are rejected without capture. Valid requests are captured before waiting or returning a controlled failure.
+
+**The capture API deliberately exposes request bodies and credentials without authentication.** Use fake credentials only; nothing captured is written to logs or disk. This fixture is not part of the production service.
+
+### Checks
+
+```sh
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+```
