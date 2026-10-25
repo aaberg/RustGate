@@ -6,7 +6,7 @@ Use a local mock upstream from the beginning. It should capture forwarded reques
 
 ## Contracts to resolve before implementation
 
-- **Authoritative prompt:** add the product system prompt to the issuance API and persisted job data. Never trust a client-supplied sentinel as proof that the authoritative prompt is present; a container could spoof it.
+- **Authoritative prompt — issuance contract resolved in step 2:** `system_prompt` is required in the issuance API and persisted job data. Step 5 must never trust a client-supplied sentinel as proof that this authoritative prompt is present; a container could spoof it.
 - **Token quota:** checking previously consumed tokens cannot enforce a hard cap under concurrency. Define reservation rules, output limits, and handling for missing usage, disconnects, and restarts.
 - **Lifecycle:** use the API's revocation behavior consistently: in-flight calls complete, but new calls fail. Clarify the testing language and define what `/done` does to in-flight reservations.
 - **Routing:** use a method-and-path allowlist. `/v1/models` ordinarily needs `GET`, unlike chat and embeddings.
@@ -19,7 +19,7 @@ Each increment delivers demonstrable behavior, not just scaffolding.
 | Step | Deliverable | Acceptance check |
 | --- | --- | --- |
 | **1. Runnable service and mock upstream — complete** | Configuration loading, `/healthz`, graceful shutdown, and a local upstream fixture. | Start the service and call health; drive the fixture through ordinary and delayed responses. |
-| **2. Job issuance and persistence** | SQLite migrations, authenticated control plane over TLS, key-pool configuration, and `POST /v1/jobs`. Generate secure tokens; persist only hashes and the job's authoritative prompt. | Issue a job, inspect persisted state, restart the service, and verify the job survives. Reject unauthenticated issuance and unknown key IDs. |
+| **2. Job issuance and persistence — complete** | SQLite migrations, authenticated control plane over TLS, key-pool configuration, and `POST /v1/jobs`. Generate secure tokens; persist only hashes and the job's authoritative prompt. | Issue a job, inspect persisted state, restart the service, and verify the job survives. Reject unauthenticated issuance and unknown key IDs. |
 | **3. First complete proxy request** | Support non-streaming chat only: job-token authentication, active-state checks, exact route allowlisting, bounded request bodies, and upstream authorization replacement. Never retry automatically. | Issue a token and send a chat request. The mock sees the configured upstream credential, not the job token. Invalid tokens and forbidden routes never reach it. |
 | **4. Complete job lifecycle** | Expiry, revoke, and done transitions, including their interaction with requests already admitted. | Hold an upstream request open, revoke the job, verify that request finishes while subsequent requests fail. Exercise expiry and done across restart. |
 | **5. Authoritative prompt injection** | Inject the stored operator prompt using a deterministic rule; preserve permitted client messages without trusting their sentinel claims. Apply only to supported chat requests. | Inspect the upstream payload for absent, spoofed, and duplicated operator-message cases. Verify exactly the intended authoritative content is injected. |
@@ -33,9 +33,9 @@ Each increment delivers demonstrable behavior, not just scaffolding.
 
 For every increment, update the relevant specification details and keep regression tests for consumer-visible boundaries and failure cases.
 
-Step 1 is implemented as the `rustgate` service and separate `mock-upstream` executable. Both are HTTP-only and loopback-only until TLS is implemented in step 2. See [the local development contract](DESIGN.md#step-1-local-development-service) for configuration, commands, fixture controls, and capture-API safety limits.
+Steps 1 and 2 are implemented as the HTTPS-only `rustgate` service and separate loopback-only HTTP `mock-upstream` executable. See [the implemented service contract](DESIGN.md#implemented-service-steps-1-and-2) for required TLS/security configuration, issuance commands, persistence, fixture controls, and capture-API safety limits.
 
-Verification: 9 regression tests pass; Clippy passes with warnings denied. Live HTTP checks cover health, configuration-file/environment precedence, ordinary and delayed completions, incremental SSE with usage, controlled failures, request capture/eviction/clearing, invalid input and body limits, startup rejection, and graceful shutdown while a delayed request is active. No authenticated proxy behavior is implemented yet.
+Verification: 24 regression tests pass; Clippy passes with warnings denied; both binaries build. Live HTTPS checks cover health, successful issuance, persisted prompt/hash/limits, invalid control credentials, unknown key rejection, job-token rejection on the control plane, plaintext HTTP refusal, restart preserving the exact job row, duplicate issuance after restart, new issuance after restart, private database permissions, raw-credential absence from database/logs, TLS startup failures, and graceful SIGTERM. Regression tests additionally cover concurrent duplicate issuance, strict input and quota-bound validation, exact body-size boundaries, and transactional migrations. Proxy forwarding remains step 3.
 
 ## Release checkpoints
 
