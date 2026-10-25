@@ -55,15 +55,38 @@ async fn captures(mock: Router) -> Value {
     .2
 }
 
+fn unread_body() -> Body {
+    Body::from_stream(futures_util::stream::pending::<
+        Result<String, std::io::Error>,
+    >())
+}
+
+async fn bounded_send(app: Router, request: Request<Body>) -> (StatusCode, HeaderMap, Value) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), send(app, request))
+        .await
+        .expect("request did not complete without reading its body")
+}
+
+fn assert_exhausted(status: StatusCode, headers: &HeaderMap, body: &Value) {
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    assert!(!headers.contains_key(header::RETRY_AFTER));
+    assert_eq!(
+        body,
+        &json!({"error":{"message":"Request quota exhausted"}})
+    );
+    assert_private_error(body);
+}
+
 #[tokio::test]
 async fn admission_rejects_invalid_tokens_before_reading_bodies_or_forwarding() {
     let mock = crate::mock::router();
     let (fixture, _upstream) = fixture(mock.clone(), "").await;
     let token = token(&fixture).await;
     let mut requests = vec![
-        chat("{malformed", None),
-        chat("{malformed", Some("unknown-job-token")),
-        chat("{malformed", Some(CONTROL_TOKEN)),
+        chat(unread_body(), None),
+        chat(unread_body(), Some("unknown-job-token")),
+        chat(unread_body(), Some(CONTROL_TOKEN)),
         chat("x".repeat(MAX_BODY_BYTES + 1), None),
     ];
     let mut duplicate = chat("{malformed", Some(&token));
@@ -80,13 +103,14 @@ async fn admission_rejects_invalid_tokens_before_reading_bodies_or_forwarding() 
         requests.push(request);
     }
     for request in requests {
-        let (status, headers, body) = send(fixture.app.clone(), request).await;
+        let (status, headers, body) = bounded_send(fixture.app.clone(), request).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(headers[header::WWW_AUTHENTICATE], "Bearer");
         assert_eq!(headers[header::CACHE_CONTROL], "no-store");
         assert_private_error(&body);
     }
     assert_eq!(captures(mock).await, json!([]));
+    assert_eq!(persisted(&fixture.path)["requests_used"], 0);
 }
 
 #[tokio::test]
@@ -99,19 +123,26 @@ async fn inactive_expired_missing_keys_and_storage_failures_never_forward() {
         connection
             .execute("UPDATE jobs SET status = ?1", [state])
             .unwrap();
-        let (status, _, body) = send(fixture.app.clone(), chat("{malformed", Some(&token))).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_private_error(&body);
+        let (status, headers, body) =
+            bounded_send(fixture.app.clone(), chat(unread_body(), Some(&token))).await;
+        if state == "exhausted" {
+            assert_exhausted(status, &headers, &body);
+        } else {
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_private_error(&body);
+        }
+        assert_eq!(persisted(&fixture.path)["requests_used"], 0);
     }
     connection
         .execute_batch("UPDATE jobs SET status = 'active', created_at = 0, expires_at = 1")
         .unwrap();
     assert_eq!(
-        send(fixture.app.clone(), chat("{malformed", Some(&token)))
+        bounded_send(fixture.app.clone(), chat(unread_body(), Some(&token)))
             .await
             .0,
         StatusCode::UNAUTHORIZED
     );
+    assert_eq!(persisted(&fixture.path)["requests_used"], 0);
     connection
         .execute_batch("UPDATE jobs SET status = 'active', expires_at = 9223372036854775807")
         .unwrap();
@@ -123,9 +154,10 @@ async fn inactive_expired_missing_keys_and_storage_failures_never_forward() {
         .insert("replacement".to_owned(), "different-secret".to_owned());
     let app = router(settings, Store::open(&fixture.path).unwrap()).unwrap();
     assert_eq!(
-        send(app, chat("{malformed", Some(&token))).await.0,
+        bounded_send(app, chat(unread_body(), Some(&token))).await.0,
         StatusCode::UNAUTHORIZED
     );
+    assert_eq!(persisted(&fixture.path)["requests_used"], 1);
     connection.execute_batch("DROP TABLE jobs").unwrap();
     let (status, _, body) = send(fixture.app, chat(chat_body().to_string(), Some(&token))).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -165,6 +197,7 @@ async fn allowlist_matches_exact_method_and_raw_path_before_parsing() {
         assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
     }
     assert_eq!(captures(mock).await, json!([]));
+    assert_eq!(persisted(&fixture.path)["requests_used"], 14);
 }
 
 #[tokio::test]
@@ -231,6 +264,7 @@ async fn non_streaming_json_and_exact_body_limit_are_enforced() {
         json!({"role": "system", "content": valid_body()["system_prompt"]}),
     );
     assert_eq!(forwarded, body);
+    assert_eq!(persisted(&fixture.path)["requests_used"], 11);
 }
 
 #[tokio::test]
@@ -299,6 +333,7 @@ async fn upstream_failures_pass_through_once_and_redirects_are_not_followed() {
     assert_eq!(headers[header::RETRY_AFTER], "1");
     assert_eq!(body["error"]["code"], "mock_unavailable");
     assert_eq!(captures(mock.clone()).await.as_array().unwrap().len(), 1);
+    assert_eq!(persisted(&fixture.path)["requests_used"], 1);
 
     let redirect = Router::new().route(
         "/v1/chat/completions",
@@ -317,6 +352,7 @@ async fn upstream_failures_pass_through_once_and_redirects_are_not_followed() {
     assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
     assert!(!headers.contains_key(header::LOCATION));
     assert_eq!(body, json!({"redirect":true}));
+    assert_eq!(persisted(&fixture.path)["requests_used"], 1);
 }
 
 #[tokio::test]
@@ -328,15 +364,22 @@ async fn connection_and_incomplete_response_failures_are_generic_bad_gateway() {
     let (status, _, body) = send(fixture.app, chat(chat_body().to_string(), Some(&token))).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_private_error(&body);
+    assert_eq!(persisted(&fixture.path)["requests_used"], 1);
 
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = calls.clone();
     let broken = Router::new().route(
         "/v1/chat/completions",
-        post(|| async {
-            let chunks = futures_util::stream::iter([
-                Ok(axum::body::Bytes::from_static(b"partial")),
-                Err(std::io::Error::other("sensitive upstream failure")),
-            ]);
-            Body::from_stream(chunks)
+        post(move || {
+            let count = count.clone();
+            async move {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let chunks = futures_util::stream::iter([
+                    Ok(axum::body::Bytes::from_static(b"partial")),
+                    Err(std::io::Error::other("sensitive upstream failure")),
+                ]);
+                Body::from_stream(chunks)
+            }
         }),
     );
     let (fixture, _upstream) = self::fixture(broken, "").await;
@@ -344,6 +387,8 @@ async fn connection_and_incomplete_response_failures_are_generic_bad_gateway() {
     let (status, _, body) = send(fixture.app, chat(chat_body().to_string(), Some(&token))).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_eq!(body, json!({"error":{"message":"Upstream request failed"}}));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(persisted(&fixture.path)["requests_used"], 1);
 }
 
 #[tokio::test]
@@ -381,7 +426,15 @@ async fn restarted_jobs_use_the_selected_key_without_forwarding_client_headers()
     let app = router(settings, Store::open(&fixture.path).unwrap()).unwrap();
     let mut issue_body = valid_body();
     issue_body["upstream_key_id"] = json!("second");
+    issue_body["max_requests"] = json!(2);
     let (_, _, issued) = issue(app.clone(), issue_body).await;
+    assert_eq!(
+        send(app.clone(), chat("{malformed", issued["token"].as_str()))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(persisted(&fixture.path)["requests_used"], 1);
     drop(app);
     drop(fixture.app);
     let mut settings = config(fixture.path.clone());
@@ -392,6 +445,7 @@ async fn restarted_jobs_use_the_selected_key_without_forwarding_client_headers()
         .upstream_keys
         .insert("second".to_owned(), "second-pool-secret".to_owned());
     let app = router(settings, Store::open(&fixture.path).unwrap()).unwrap();
+    assert_eq!(persisted(&fixture.path)["requests_used"], 1);
     let body = chat_body();
     let mut request = chat(body.to_string(), issued["token"].as_str());
     for name in [
@@ -408,9 +462,15 @@ async fn restarted_jobs_use_the_selected_key_without_forwarding_client_headers()
     request
         .headers_mut()
         .insert(header::HOST, "attacker.invalid".parse().unwrap());
-    let (status, _, response) = send(app, request).await;
+    let (status, _, response) = send(app.clone(), request).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(response, json!({"accepted": true}));
+    assert_eq!(persisted(&fixture.path)["requests_used"], 2);
+    assert_eq!(persisted(&fixture.path)["status"], "exhausted");
+    let (status, headers, body) =
+        bounded_send(app, chat(unread_body(), issued["token"].as_str())).await;
+    assert_exhausted(status, &headers, &body);
+    assert_eq!(persisted(&fixture.path)["requests_used"], 2);
 }
 
 #[tokio::test]
@@ -530,5 +590,122 @@ async fn missing_or_non_array_messages_are_rejected_without_forwarding() {
                 .contains(valid_body()["system_prompt"].as_str().unwrap())
         );
     }
+    assert_eq!(captures(mock).await, json!([]));
+}
+
+#[tokio::test]
+async fn concurrent_admissions_stop_at_the_persisted_allowance_across_restart() {
+    let mock = crate::mock::router();
+    let (mut fixture, upstream) = fixture(mock.clone(), "").await;
+    let mut body = valid_body();
+    body["max_requests"] = json!(5);
+    let (status, _, issued) = issue(fixture.app.clone(), body).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let token = issued["token"].as_str().unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            send(
+                fixture.app.clone(),
+                chat(chat_body().to_string(), Some(token))
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(persisted(&fixture.path)["requests_used"], 2);
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(32));
+    let mut requests = Vec::new();
+    for _ in 0..32 {
+        let app = fixture.app.clone();
+        let request = chat(chat_body().to_string(), Some(token));
+        let barrier = barrier.clone();
+        requests.push(tokio::spawn(async move {
+            barrier.wait().await;
+            send(app, request).await
+        }));
+    }
+    let responses = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        futures_util::future::join_all(requests),
+    )
+    .await
+    .expect("concurrent quota requests did not complete");
+    let mut admitted = 0;
+    let mut denied = 0;
+    for response in responses {
+        let (status, headers, body) = response.unwrap();
+        if status == StatusCode::OK {
+            admitted += 1;
+        } else {
+            assert_exhausted(status, &headers, &body);
+            denied += 1;
+        }
+    }
+    assert_eq!((admitted, denied), (3, 29));
+    assert_eq!(captures(mock.clone()).await.as_array().unwrap().len(), 5);
+    let charged = persisted(&fixture.path);
+    assert_eq!(charged["requests_used"], 5);
+    assert_eq!(charged["tokens_used"], 0);
+    assert_eq!(charged["status"], "exhausted");
+
+    // Exhaustion remains the first terminal state even once its TTL passes.
+    Connection::open(&fixture.path)
+        .unwrap()
+        .execute_batch("UPDATE jobs SET created_at = 0, expires_at = 1")
+        .unwrap();
+    let exhausted = persisted(&fixture.path);
+    let mut settings = config(fixture.path.clone());
+    settings.upstream_base_url = format!("http://{}", upstream.address).parse().unwrap();
+    fixture.app = router(settings, Store::open(&fixture.path).unwrap()).unwrap();
+    for path in ["/v1/chat/completions", "/v1/models"] {
+        let mut request = chat(unread_body(), Some(token));
+        *request.uri_mut() = path.parse().unwrap();
+        let (status, headers, body) = bounded_send(fixture.app.clone(), request).await;
+        assert_exhausted(status, &headers, &body);
+        assert_eq!(persisted(&fixture.path), exhausted);
+    }
+    assert_eq!(captures(mock).await.as_array().unwrap().len(), 5);
+}
+
+#[tokio::test]
+async fn admitted_invalid_requests_consume_the_entire_allowance_without_forwarding() {
+    let mock = crate::mock::router();
+    let (fixture, _upstream) = fixture(mock.clone(), "").await;
+    let mut body = valid_body();
+    body["max_requests"] = json!(4);
+    let (status, _, issued) = issue(fixture.app.clone(), body).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let token = issued["token"].as_str().unwrap();
+    let failed_read = Body::from_stream(futures_util::stream::iter([Err::<String, _>(
+        std::io::Error::other("sensitive client read failure"),
+    )]));
+    let mut forbidden = chat(unread_body(), Some(token));
+    *forbidden.uri_mut() = "/v1/models".parse().unwrap();
+    for (index, (request, expected)) in [
+        (chat("{malformed", Some(token)), StatusCode::BAD_REQUEST),
+        (
+            chat("x".repeat(MAX_BODY_BYTES + 1), Some(token)),
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+        (chat(failed_read, Some(token)), StatusCode::BAD_REQUEST),
+        (forbidden, StatusCode::FORBIDDEN),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (status, headers, body) = bounded_send(fixture.app.clone(), request).await;
+        assert_eq!(status, expected);
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        assert_private_error(&body);
+        assert_eq!(persisted(&fixture.path)["requests_used"], json!(index + 1));
+    }
+    let exhausted = persisted(&fixture.path);
+    assert_eq!(exhausted["status"], "exhausted");
+    let (status, headers, body) =
+        bounded_send(fixture.app.clone(), chat(unread_body(), Some(token))).await;
+    assert_exhausted(status, &headers, &body);
+    assert_eq!(persisted(&fixture.path), exhausted);
     assert_eq!(captures(mock).await, json!([]));
 }

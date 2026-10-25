@@ -62,7 +62,7 @@ Order of checks on every proxied request:
 
 * AuthN: valid job token → hashed lookup in jobs.
 * AuthZ/state: job is active; token not expired; not revoked.
-* Quotas: requests_used < max_requests and tokens_used < max_tokens_total. If exceeded: return 429 with a clear error and mark job exhausted. Increment requests_used before forwarding (with a reservation that's reconciled on completion — don't let concurrent requests race past the cap).
+* Quotas: atomically require requests_used < max_requests and permanently increment requests_used at admission, before route/body checks. The final permitted admission marks the job exhausted; subsequent attempts return 429. Admitted rejections and upstream failures are charged without refund. Token reservations, enforcement of max_tokens_total, and usage reconciliation belong to steps 8–9.
 * Path allowlist: only the configured upstream endpoints are forwardable (/v1/chat/completions, /v1/embeddings, /v1/models). Anything else → 403. This prevents a jailbroken agent from using admin endpoints or other products under the same upstream account.
 * Body policy checks (fast, local, no LLM):
   * Request size cap (e.g. 1 MB) — also your cost guard.
@@ -107,9 +107,9 @@ Order of checks on every proxied request:
  * Streaming: SSE response streams incrementally end-to-end.
  * Path allowlist rejects /v1/admin style paths.
 
-## Implemented service: steps 1 through 5
+## Implemented service: steps 1 through 6
 
-The service implements HTTPS, configuration, health, graceful shutdown, authenticated job issuance, SQLite persistence, job-authenticated non-streaming chat proxying, durable expiry/revoke/done transitions, and authoritative prompt injection. The separate mock remains a loopback-only HTTP fixture. Quota enforcement, streaming, and full resource bounds are **not implemented yet**; persisted caps are issuance metadata until their roadmap increments. Do not connect real build containers yet.
+The service implements HTTPS, configuration, health, graceful shutdown, authenticated job issuance, SQLite persistence, job-authenticated non-streaming chat proxying, durable expiry/revoke/done transitions, authoritative prompt injection, and concurrent request quotas. The separate mock remains a loopback-only HTTP fixture. Token accounting/enforcement, streaming, and full resource bounds are **not implemented yet**; persisted token caps remain issuance metadata. Do not connect real build containers yet.
 
 ### Running
 
@@ -210,7 +210,7 @@ Revoke persists `status = revoked` and the UTC epoch-second `revoked_at`. Done p
 
 Expiry is effective when `expires_at <= now`, using UTC epoch seconds sampled after obtaining the SQLite transaction lock. Startup persists `expired` for every overdue active job. During service operation, admission and lifecycle operations materialize expiry for the job they access; there is no background expiry sweep. An untouched overdue row can therefore still read `active` directly from SQLite until access or restart, but its token cannot admit a new call. An overdue active job becomes `expired` before a revoke/done attempt, which returns `409`.
 
-Admission and lifecycle transitions serialize in SQLite Immediate transactions, including across independently opened store connections. Admission commits a snapshot of the eligible job's key ID and authoritative prompt before reading the request body or contacting upstream. A request admitted before revoke, done, or expiry continues using that snapshot without rechecking status, even if its body or upstream response is still pending. Once a transition completes, subsequent admission fails with `401`. Terminal state and revocation metadata survive restart; an unexpired active job's original token continues to work.
+Admission and lifecycle transitions serialize in SQLite Immediate transactions, including across independently opened store connections. Admission commits one request charge and a snapshot of the eligible job's key ID and authoritative prompt before reading the request body or contacting upstream. A request admitted before revoke, done, expiry, or exhaustion continues using that snapshot without rechecking status, even if its body or upstream response is still pending. Once a transition completes, subsequent admission fails with `401`, or `429` for exhaustion. Terminal state, usage, and revocation metadata survive restart; an unexpired active job's original token continues to work within its remaining allowance.
 
 ### Proxying a chat request
 
@@ -229,9 +229,9 @@ curl http://127.0.0.1:9090/__mock/requests
 # authorization is "Bearer fake-upstream-credential", never the job token
 ```
 
-Admission hashes the bearer and looks up the persisted job on every request, requiring `status = active` and `expires_at` strictly later than the current epoch second. Missing, malformed, duplicate, unknown, expired, or inactive job credentials receive generic `401` with `WWW-Authenticate: Bearer`. Control credentials are not job credentials. A job whose key ID has been removed from the startup key pool also receives `401`; storage failures receive generic `500`. Expiry and revoke/done ordering follow the lifecycle contract above.
+Admission hashes the bearer and looks up the persisted job on every request, requiring `status = active`, `expires_at` strictly later than the current epoch second, and remaining request allowance. Missing, malformed, duplicate, unknown, expired, revoked, or done job credentials receive generic `401` with `WWW-Authenticate: Bearer`; exhausted jobs receive `429` as specified below. Control credentials are not job credentials. A job whose key ID has been removed from the startup key pool also receives `401` after its admission is charged; storage failures receive generic `500`. Expiry and revoke/done ordering follow the lifecycle contract above.
 
-After authentication, the fixed allowlist permits only exact `POST /v1/chat/completions`. Other methods and paths receive `403`, including trailing slashes, encoded alternatives, embeddings, models, and admin paths. The separate health, issuance, and lifecycle routes retain their own contracts. Authentication and route checks precede body reads.
+After charged admission, the fixed allowlist permits only exact `POST /v1/chat/completions`. Other methods and paths receive `403`, including trailing slashes, encoded alternatives, embeddings, models, and admin paths. The separate health, issuance, and lifecycle routes retain their own contracts and do not consume job request allowance. Authentication, quota admission, and route checks precede body reads.
 
 The body must be a JSON object with a JSON content type and at most 1 MiB, including unknown-length/chunked bodies. `messages` must be an array (an empty array is permitted); missing or non-array values receive `400`. `stream` must be omitted or literal `false`; streaming, invalid JSON, non-object bodies, and invalid content types receive `400`, while oversized bodies receive `413`. Message-entry schemas and other provider-specific chat fields are left to upstream validation. JSON is parsed and reserialized before forwarding so duplicate keys cannot give the proxy and upstream different interpretations.
 
@@ -243,9 +243,18 @@ The 1 MiB cap applies to the incoming body before injection; the transformed ups
 
 The configured upstream base path is a prefix: `https://host/gateway/` targets `/gateway/v1/chat/completions`. The admitted request's query is preserved, but its host and path cannot select another destination. A fresh upstream request contains the selected key as bearer authorization and JSON content type, without forwarding client authorization, cookies, proxy credentials, or arbitrary client headers. Redirects and automatic retries are disabled, as are environment-selected HTTP proxies.
 
-Responses are buffered in this increment. Upstream status and body pass through, along with `Content-Type`, `Content-Encoding`, and `Retry-After` when present; other upstream headers, including redirects' `Location` and cookies, are not forwarded. Compressed bodies are not decompressed by the proxy: all `Content-Encoding` values are preserved in order so clients can decode the unchanged bytes. Proxy responses use `Cache-Control: no-store`. Connection and response-read failures receive generic `502` without underlying diagnostics or credentials. Upstream failures are never retried; the client decides whether to retry. Usage in a completion is returned but not accounted, and requests do not yet consume or enforce persisted quotas.
+Responses are buffered in this increment. Upstream status and body pass through, along with `Content-Type`, `Content-Encoding`, and `Retry-After` when present; other upstream headers, including redirects' `Location` and cookies, are not forwarded. Compressed bodies are not decompressed by the proxy: all `Content-Encoding` values are preserved in order so clients can decode the unchanged bytes. Proxy responses use `Cache-Control: no-store`. Connection and response-read failures receive generic `502` without underlying diagnostics or credentials. Upstream failures are never retried; the client decides whether to retry. Usage in a completion is returned but tokens are not yet accounted or capped.
 
 The response buffer, upstream timeouts, disconnect handling, and in-flight concurrency are not yet bounded by the step 7 policy. SSE is not forwarded incrementally.
+
+### Concurrent request quotas
+
+`requests_used` counts admitted attempts, not successful upstream completions. SQLite atomically checks the remaining allowance, increments the counter, and returns the admitted snapshot in one Immediate transaction. No upstream work starts before that transaction commits. The final slot also persists `status = exhausted`, without cancelling the request that consumed it. Concurrent admissions, including from independent service processes sharing the database, cannot spend the same slot twice.
+
+Every admitted attempt retains its charge: forbidden routes, missing configured upstream keys, malformed/unsupported/oversized bodies, body-read failures, upstream HTTP errors, connect/response-read failures, cancellation, and restart after admission. Invalid credentials, inactive/expired jobs, quota denials, and failed admission transactions do not increment the counter. This conservative attempted-request policy avoids refunds when forwarding or billing is uncertain; a client retry needs another slot. There is no completion-time request reconciliation or outstanding request reservation to recover. Token reservations and request records remain steps 8–9.
+
+An exhausted token receives `429` with `{"error":{"message":"Request quota exhausted"}}` and `Cache-Control: no-store`, before route checks or body reads. It receives neither `Retry-After` nor `WWW-Authenticate`: waiting cannot restore that job's allowance. Issue a new job through the control plane if more work is authorized. The first terminal state still wins: exhaustion is retained after TTL expiry/restart and makes `/done` and `/revoke` return `409`; a job already done, revoked, or expired remains `401`. Neither lifecycle transitions nor request completion reset or refund the counter. Existing databases use the same schema and persisted counters; no migration is required.
+
 
 ### Local mock upstream
 

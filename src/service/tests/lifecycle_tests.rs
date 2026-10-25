@@ -59,6 +59,10 @@ async fn assert_error(app: Router, request: Request<Body>, expected: StatusCode)
     if expected == StatusCode::UNAUTHORIZED {
         assert_eq!(headers[header::WWW_AUTHENTICATE], "Bearer");
     }
+    if expected == StatusCode::TOO_MANY_REQUESTS {
+        assert!(!headers.contains_key(header::RETRY_AFTER));
+        assert_eq!(body, json!({"error":{"message":"Request quota exhausted"}}));
+    }
     assert_private_error(&body);
     body
 }
@@ -134,8 +138,15 @@ async fn transitions_are_canonical_bodyless_durable_and_first_terminal_wins() {
         let token = issued_token(&fixture).await;
         Connection::open(&fixture.path)
             .unwrap()
-            .execute_batch("UPDATE jobs SET requests_used = 7, tokens_used = 123")
+            .execute_batch("UPDATE jobs SET requests_used = 6, tokens_used = 123")
             .unwrap();
+        assert_error(
+            fixture.app.clone(),
+            chat(&token, Body::from("{malformed")),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert_eq!(persisted(&fixture.path)["requests_used"], 7);
         let mut expected = persisted(&fixture.path);
         let before = epoch_seconds();
         assert_no_content(
@@ -205,6 +216,13 @@ async fn overdue_jobs_are_materialized_by_startup_admission_and_lifecycle_operat
     for trigger in ["startup", "admission", "revoke", "done"] {
         let mut fixture = Fixture::new();
         let token = issued_token(&fixture).await;
+        assert_error(
+            fixture.app.clone(),
+            chat(&token, Body::from("{malformed")),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert_eq!(persisted(&fixture.path)["requests_used"], 1);
         Connection::open(&fixture.path)
             .unwrap()
             .execute(
@@ -273,11 +291,17 @@ async fn overdue_jobs_are_materialized_by_startup_admission_and_lifecycle_operat
 #[tokio::test]
 async fn exhausted_jobs_cannot_be_reopened_by_either_lifecycle_endpoint() {
     let fixture = Fixture::new();
-    let token = issued_token(&fixture).await;
-    Connection::open(&fixture.path)
-        .unwrap()
-        .execute_batch("UPDATE jobs SET status = 'exhausted'")
-        .unwrap();
+    let mut body = valid_body();
+    body["max_requests"] = json!(1);
+    let (status, _, issued) = issue(fixture.app.clone(), body).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let token = issued["token"].as_str().unwrap();
+    assert_error(
+        fixture.app.clone(),
+        chat(token, Body::from("{malformed")),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
     let original = persisted(&fixture.path);
     for action in ["revoke", "done"] {
         assert_error(
@@ -289,8 +313,8 @@ async fn exhausted_jobs_cannot_be_reopened_by_either_lifecycle_endpoint() {
     }
     assert_error(
         fixture.app.clone(),
-        chat(&token, unread_body()),
-        StatusCode::UNAUTHORIZED,
+        chat(token, unread_body()),
+        StatusCode::TOO_MANY_REQUESTS,
     )
     .await;
     assert_eq!(persisted(&fixture.path), original);
@@ -416,9 +440,15 @@ async fn held_upstream() -> (Fixture, HeldUpstream) {
 
 #[tokio::test]
 async fn admitted_requests_finish_after_terminal_transition_even_before_body_read_completes() {
-    for action in ["revoke", "done", "expire"] {
+    for action in ["revoke", "done", "expire", "exhaust"] {
         let (fixture, mut upstream) = held_upstream().await;
-        let token = issued_token(&fixture).await;
+        let mut issue_body = valid_body();
+        if action == "exhaust" {
+            issue_body["max_requests"] = json!(1);
+        }
+        let (status, _, issued) = issue(fixture.app.clone(), issue_body).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let token = issued["token"].as_str().unwrap();
         let (body_entered_tx, body_entered_rx) = oneshot::channel();
         let (body_release_tx, body_release_rx) = oneshot::channel();
         let body = Body::from_stream(futures_util::stream::once(async move {
@@ -433,11 +463,21 @@ async fn admitted_requests_finish_after_terminal_transition_even_before_body_rea
             )
         }));
         let app = fixture.app.clone();
-        let admitted = tokio::spawn(send(app, chat(&token, body)));
+        let admitted = tokio::spawn(send(app, chat(token, body)));
         // Reaching the body proves admission has completed, without relying on a sleep.
         bounded(body_entered_rx).await.unwrap();
         assert_eq!(upstream.calls.load(Ordering::SeqCst), 0);
-        if action == "expire" {
+        assert_eq!(persisted(&fixture.path)["requests_used"], 1);
+        if action == "exhaust" {
+            for action in ["revoke", "done"] {
+                assert_error(
+                    fixture.app.clone(),
+                    lifecycle(JOB_ID, action, Some(CONTROL_TOKEN), Body::empty()),
+                    StatusCode::CONFLICT,
+                )
+                .await;
+            }
+        } else if action == "expire" {
             Connection::open(&fixture.path)
                 .unwrap()
                 .execute(
@@ -452,22 +492,23 @@ async fn admitted_requests_finish_after_terminal_transition_even_before_body_rea
             )
             .await;
         }
-        assert_error(
-            fixture.app.clone(),
-            chat(&token, unread_body()),
-            StatusCode::UNAUTHORIZED,
-        )
-        .await;
+        let rejection = if action == "exhaust" {
+            StatusCode::TOO_MANY_REQUESTS
+        } else {
+            StatusCode::UNAUTHORIZED
+        };
+        assert_error(fixture.app.clone(), chat(token, unread_body()), rejection).await;
         let terminal = persisted(&fixture.path);
         assert_eq!(
             terminal["status"],
             match action {
                 "revoke" => "revoked",
                 "done" => "done",
+                "exhaust" => "exhausted",
                 _ => "expired",
             }
         );
-        assert_eq!(terminal["requests_used"], 0);
+        assert_eq!(terminal["requests_used"], 1);
         assert_eq!(terminal["tokens_used"], 0);
 
         body_release_tx.send(()).unwrap();
@@ -475,8 +516,8 @@ async fn admitted_requests_finish_after_terminal_transition_even_before_body_rea
         assert!(!admitted.is_finished());
         assert_error(
             fixture.app.clone(),
-            chat(&token, Body::from("{malformed")),
-            StatusCode::UNAUTHORIZED,
+            chat(token, Body::from("{malformed")),
+            rejection,
         )
         .await;
         upstream.release.take().unwrap().send(()).unwrap();
@@ -490,4 +531,42 @@ async fn admitted_requests_finish_after_terminal_transition_even_before_body_rea
         assert_eq!(upstream.calls.load(Ordering::SeqCst), 1);
         assert_eq!(persisted(&fixture.path), terminal);
     }
+}
+
+#[tokio::test]
+async fn cancelled_admissions_remain_charged_and_exhausted_after_restart() {
+    let (mut fixture, upstream) = held_upstream().await;
+    let mut body = valid_body();
+    body["max_requests"] = json!(1);
+    let (status, _, issued) = issue(fixture.app.clone(), body).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let token = issued["token"].as_str().unwrap();
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let body = Body::from_stream(futures_util::stream::once(async move {
+        entered_tx.send(()).unwrap();
+        std::future::pending::<Result<String, std::io::Error>>().await
+    }));
+    let admitted = tokio::spawn(send(fixture.app.clone(), chat(token, body)));
+    bounded(entered_rx).await.unwrap();
+    let charged = persisted(&fixture.path);
+    assert_eq!(charged["requests_used"], 1);
+    assert_eq!(charged["status"], "exhausted");
+    admitted.abort();
+    assert!(bounded(admitted).await.unwrap_err().is_cancelled());
+    assert_eq!(persisted(&fixture.path), charged);
+    assert_eq!(upstream.calls.load(Ordering::SeqCst), 0);
+
+    fixture.app = router(
+        config(fixture.path.clone()),
+        Store::open(&fixture.path).unwrap(),
+    )
+    .unwrap();
+    assert_error(
+        fixture.app.clone(),
+        chat(token, unread_body()),
+        StatusCode::TOO_MANY_REQUESTS,
+    )
+    .await;
+    assert_eq!(persisted(&fixture.path), charged);
+    assert_eq!(upstream.calls.load(Ordering::SeqCst), 0);
 }

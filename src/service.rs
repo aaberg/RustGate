@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use crate::{
     config::Config,
-    store::{InsertError, JobTransition, NewJob, Store, TransitionError},
+    store::{InsertError, JobAdmission, JobTransition, NewJob, Store, TransitionError},
 };
 
 const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -161,8 +161,11 @@ async fn proxy_chat(State(state): State<Arc<ServiceState>>, request: Request) ->
     let token_hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
     let store = state.store.clone();
     let job = match tokio::task::spawn_blocking(move || store.admit_job(token_hash)).await {
-        Ok(Ok(Some(job))) => job,
-        Ok(Ok(None)) => return unauthorized(),
+        Ok(Ok(JobAdmission::Admitted(job))) => job,
+        Ok(Ok(JobAdmission::Unauthorized)) => return unauthorized(),
+        Ok(Ok(JobAdmission::Exhausted)) => {
+            return error(StatusCode::TOO_MANY_REQUESTS, "Request quota exhausted");
+        }
         Ok(Err(_)) | Err(_) => {
             return error(
                 StatusCode::INTERNAL_SERVER_ERROR,
