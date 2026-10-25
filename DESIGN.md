@@ -42,11 +42,11 @@ request_log (append-only, one row per proxied request)
 
 2. POST /v1/jobs/{job_id}/revoke — immediate kill switch (builder service, or an admin)
 
-* Marks the job revoked. Any in-flight proxied request is completed; any new request gets 401.
+* Marks an active, unexpired job revoked. Requests already admitted complete; new requests get 401. Requires the same control-plane authentication as issuance.
 
 3. POST /v1/jobs/{job_id}/done — job finished normally
 
-* Marks done, releases the quota reservation, closes the log entry.
+* Marks an active, unexpired job done and closes admission. Requests already admitted complete; new requests get 401. Requires control-plane authentication. Once accounting is implemented, in-flight reservations must remain charged until their requests reconcile; `/done` must not release them early or reset usage.
 
 4. POST /v1/chat/completions, POST /v1/embeddings, etc. — proxy endpoints (called by build containers)
 
@@ -100,16 +100,16 @@ Order of checks on every proxied request:
 ## Testing requirements (give these to the agent as acceptance criteria)
 
  * Token issuance → proxied call → expiry → rejection flow end-to-end.
- * Revoke kills in-flight-then-new requests immediately.
+ * Hold an admitted upstream call open, revoke the job, and verify the held call completes while subsequent requests immediately fail. Apply the same admission boundary to done and expiry.
  * Quota exhaustion: request cap and token cap both enforced under concurrency (spawn parallel requests; assert the cap holds).
  * Secret-scan: a request body containing a fake sk- key is blocked; a benign body is not.
  * System-prompt injection: request without the operator system message gets it prepended; with it, no duplicate.
  * Streaming: SSE response streams incrementally end-to-end.
  * Path allowlist rejects /v1/admin style paths.
 
-## Implemented service: steps 1 through 3
+## Implemented service: steps 1 through 4
 
-The service implements HTTPS, configuration, health, graceful shutdown, authenticated job issuance, SQLite persistence, and job-authenticated non-streaming chat proxying. The separate mock remains a loopback-only HTTP fixture. Lifecycle transitions, prompt injection, quota enforcement, streaming, and full resource bounds are **not implemented yet**; persisted caps are issuance metadata until their roadmap increments. Do not connect real build containers yet.
+The service implements HTTPS, configuration, health, graceful shutdown, authenticated job issuance, SQLite persistence, job-authenticated non-streaming chat proxying, and durable expiry/revoke/done transitions. The separate mock remains a loopback-only HTTP fixture. Prompt injection, quota enforcement, streaming, and full resource bounds are **not implemented yet**; persisted caps are issuance metadata until their roadmap increments. Do not connect real build containers yet.
 
 ### Running
 
@@ -192,6 +192,26 @@ sqlite3 rustgate.sqlite3 \
 
 An existing UUID remains reserved across restart. Reissuing it must return `409`, demonstrating that issuance state survived. Its original token remains usable for proxy calls while the job is active and unexpired.
 
+### Completing or revoking a job
+
+Both lifecycle endpoints use the control-plane credential, never the job token. Supply the issued UUID as `JOB_ID`; no request body is required or interpreted:
+
+```sh
+export JOB_ID='<job_id returned at issuance>'
+curl --cacert cert.pem -X POST \
+  "https://localhost:8443/v1/jobs/$JOB_ID/revoke" \
+  -H "Authorization: Bearer $RUSTGATE_CONTROL_PLANE_TOKEN"
+# 204, empty body. For normal completion, use /done instead of /revoke.
+```
+
+Authentication runs before path extraction or body reads. UUIDs are normalized exactly as at issuance. Success returns `204` with no body; malformed UUIDs and invalid UTF-8 job paths (for example, `%FF`) receive generic JSON `400` responses with an `error.message` field, unknown jobs `404`, and storage failures generic `500`. Path-extraction diagnostics are not exposed. Repeating the same transition returns `204` without changing metadata. A different terminal state (`expired`, `revoked`, `exhausted`, or `done`) receives `409`: the first terminal state wins, and jobs never reactivate. Responses use `Cache-Control: no-store`; invalid control credentials receive generic `401` with `WWW-Authenticate: Bearer`.
+
+Revoke persists `status = revoked` and the UTC epoch-second `revoked_at`. Done persists `status = done`. No reason-body API is provided; `revoked_reason` remains null. Neither endpoint resets usage, creates accounting records, or cancels admitted requests. Reservation and request-log machinery belongs to the later accounting increments; when added, it must reconcile admitted work normally even after `/done`.
+
+Expiry is effective when `expires_at <= now`, using UTC epoch seconds sampled after obtaining the SQLite transaction lock. Startup persists `expired` for every overdue active job. During service operation, admission and lifecycle operations materialize expiry for the job they access; there is no background expiry sweep. An untouched overdue row can therefore still read `active` directly from SQLite until access or restart, but its token cannot admit a new call. An overdue active job becomes `expired` before a revoke/done attempt, which returns `409`.
+
+Admission and lifecycle transitions serialize in SQLite Immediate transactions, including across independently opened store connections. Admission commits the eligible-key lookup before reading the request body or contacting upstream. A request admitted before revoke, done, or expiry continues without rechecking status, even if its body or upstream response is still pending. Once a transition completes, subsequent admission fails with `401`. Terminal state and revocation metadata survive restart; an unexpired active job's original token continues to work.
+
 ### Proxying a chat request
 
 Use the returned job token, not the control-plane credential:
@@ -209,9 +229,9 @@ curl http://127.0.0.1:9090/__mock/requests
 # authorization is "Bearer fake-upstream-credential", never the job token
 ```
 
-Admission hashes the bearer and looks up the persisted job on every request, requiring `status = active` and `expires_at` strictly later than the current epoch second. Missing, malformed, duplicate, unknown, expired, or inactive job credentials receive generic `401` with `WWW-Authenticate: Bearer`. Control credentials are not job credentials. A job whose key ID has been removed from the startup key pool also receives `401`; storage failures receive generic `500`. Expiry is checked without changing persisted status; revoke/done APIs and lifecycle transitions remain step 4.
+Admission hashes the bearer and looks up the persisted job on every request, requiring `status = active` and `expires_at` strictly later than the current epoch second. Missing, malformed, duplicate, unknown, expired, or inactive job credentials receive generic `401` with `WWW-Authenticate: Bearer`. Control credentials are not job credentials. A job whose key ID has been removed from the startup key pool also receives `401`; storage failures receive generic `500`. Expiry and revoke/done ordering follow the lifecycle contract above.
 
-After authentication, the fixed allowlist permits only exact `POST /v1/chat/completions`. Other methods and paths receive `403`, including trailing slashes, encoded alternatives, embeddings, models, and admin paths. The separate health and issuance routes retain their own contracts. Authentication and route checks precede body reads.
+After authentication, the fixed allowlist permits only exact `POST /v1/chat/completions`. Other methods and paths receive `403`, including trailing slashes, encoded alternatives, embeddings, models, and admin paths. The separate health, issuance, and lifecycle routes retain their own contracts. Authentication and route checks precede body reads.
 
 The body must be a JSON object with a JSON content type and at most 1 MiB, including unknown-length/chunked bodies. `stream` must be omitted or literal `false`; streaming, invalid JSON, non-object bodies, and invalid content types receive `400`, while oversized bodies receive `413`. Provider-specific chat fields are left to upstream validation. JSON is parsed and reserialized before forwarding so duplicate keys cannot give the proxy and upstream different interpretations. No authoritative prompt is injected until step 5.
 
