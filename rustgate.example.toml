@@ -13,3 +13,11 @@ default_max_requests = 100
 max_requests = 10000
 default_max_tokens_total = 2000000
 max_tokens_total = 100000000
+
+# Upstream/request deadlines in seconds (each 1..=86400).
+connect_timeout_seconds = 5
+first_byte_timeout_seconds = 60
+idle_timeout_seconds = 120
+overall_timeout_seconds = 600
+# Process-local admission capacity (1..=65536); saturation returns 503.
+max_in_flight_requests = 64

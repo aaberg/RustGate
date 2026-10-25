@@ -28,6 +28,11 @@ pub struct Config {
     pub max_requests: u64,
     pub default_max_tokens_total: u64,
     pub max_tokens_total: u64,
+    pub connect_timeout_seconds: u64,
+    pub first_byte_timeout_seconds: u64,
+    pub idle_timeout_seconds: u64,
+    pub overall_timeout_seconds: u64,
+    pub max_in_flight_requests: u64,
 }
 
 impl fmt::Debug for Config {
@@ -53,6 +58,11 @@ struct FileConfig {
     max_requests: Option<u64>,
     default_max_tokens_total: Option<u64>,
     max_tokens_total: Option<u64>,
+    connect_timeout_seconds: Option<u64>,
+    first_byte_timeout_seconds: Option<u64>,
+    idle_timeout_seconds: Option<u64>,
+    overall_timeout_seconds: Option<u64>,
+    max_in_flight_requests: Option<u64>,
 }
 
 impl Config {
@@ -124,7 +134,12 @@ fn load_with(
         default_max_requests,
         max_requests,
         default_max_tokens_total,
-        max_tokens_total
+        max_tokens_total,
+        connect_timeout_seconds,
+        first_byte_timeout_seconds,
+        idle_timeout_seconds,
+        overall_timeout_seconds,
+        max_in_flight_requests
     );
     if let Some(value) = env_value(&mut env, "RUSTGATE_UPSTREAM_KEYS")? {
         settings.upstream_keys = Some(serde_json::from_str(&value).map_err(|_| {
@@ -213,6 +228,24 @@ fn load_with(
     if max_ttl_seconds > 31536000 {
         bail!("invalid max_ttl_seconds: maximum is 31536000");
     }
+    let connect_timeout_seconds = settings.connect_timeout_seconds.unwrap_or(5);
+    let first_byte_timeout_seconds = settings.first_byte_timeout_seconds.unwrap_or(60);
+    let idle_timeout_seconds = settings.idle_timeout_seconds.unwrap_or(120);
+    let overall_timeout_seconds = settings.overall_timeout_seconds.unwrap_or(600);
+    let max_in_flight_requests = settings.max_in_flight_requests.unwrap_or(64);
+    for (name, value) in [
+        ("connect_timeout_seconds", connect_timeout_seconds),
+        ("first_byte_timeout_seconds", first_byte_timeout_seconds),
+        ("idle_timeout_seconds", idle_timeout_seconds),
+        ("overall_timeout_seconds", overall_timeout_seconds),
+    ] {
+        if !(1..=86400).contains(&value) {
+            bail!("invalid {name}: expected 1..=86400 seconds");
+        }
+    }
+    if !(1..=65536).contains(&max_in_flight_requests) {
+        bail!("invalid max_in_flight_requests: expected 1..=65536");
+    }
     Ok(Config {
         listen_addr,
         upstream_base_url,
@@ -228,6 +261,11 @@ fn load_with(
         max_requests,
         default_max_tokens_total,
         max_tokens_total,
+        connect_timeout_seconds,
+        first_byte_timeout_seconds,
+        idle_timeout_seconds,
+        overall_timeout_seconds,
+        max_in_flight_requests,
     })
 }
 
@@ -368,6 +406,81 @@ primary = "provider-credential"
         assert_eq!(config.upstream_keys["override"], "credential");
         assert!(!format!("{config:?}").contains("credential"));
         assert!(!format!("{config:?}").contains("secret"));
+    }
+
+    fn resource_values(config: &Config) -> [u64; 5] {
+        [
+            config.connect_timeout_seconds,
+            config.first_byte_timeout_seconds,
+            config.idle_timeout_seconds,
+            config.overall_timeout_seconds,
+            config.max_in_flight_requests,
+        ]
+    }
+
+    #[test]
+    fn resource_settings_load_from_file_and_environment_takes_precedence() {
+        let file = "connect_timeout_seconds = 11\nfirst_byte_timeout_seconds = 12\nidle_timeout_seconds = 13\noverall_timeout_seconds = 14\nmax_in_flight_requests = 15";
+        let config = secured(&[("RUSTGATE_CONFIG", "settings.toml")], Some(file)).unwrap();
+        assert_eq!(resource_values(&config), [11, 12, 13, 14, 15]);
+
+        let config = secured(
+            &[
+                ("RUSTGATE_CONFIG", "settings.toml"),
+                ("RUSTGATE_CONNECT_TIMEOUT_SECONDS", "21"),
+                ("RUSTGATE_FIRST_BYTE_TIMEOUT_SECONDS", "22"),
+                ("RUSTGATE_IDLE_TIMEOUT_SECONDS", "23"),
+                ("RUSTGATE_OVERALL_TIMEOUT_SECONDS", "24"),
+                ("RUSTGATE_MAX_IN_FLIGHT_REQUESTS", "25"),
+            ],
+            Some(file),
+        )
+        .unwrap();
+        assert_eq!(resource_values(&config), [21, 22, 23, 24, 25]);
+    }
+
+    #[test]
+    fn resource_bounds_apply_to_file_and_environment() {
+        for (field, maximum) in [
+            ("connect_timeout_seconds", 86400_u64),
+            ("first_byte_timeout_seconds", 86400),
+            ("idle_timeout_seconds", 86400),
+            ("overall_timeout_seconds", 86400),
+            ("max_in_flight_requests", 65536),
+        ] {
+            let name = format!("RUSTGATE_{}", field.to_ascii_uppercase());
+            for value in [1, maximum] {
+                let value = value.to_string();
+                let file = format!("{field} = {value}");
+                assert!(secured(&[(&name, &value)], None).is_ok(), "{field}={value}");
+                assert!(
+                    secured(&[("RUSTGATE_CONFIG", "settings.toml")], Some(&file)).is_ok(),
+                    "{file}"
+                );
+            }
+            for value in [0, maximum + 1, u64::MAX] {
+                let value = value.to_string();
+                let file = format!("{field} = {value}");
+                let error = secured(&[(&name, &value)], None).unwrap_err();
+                assert!(error.to_string().contains(field), "{field}={value}");
+                assert!(
+                    secured(&[("RUSTGATE_CONFIG", "settings.toml")], Some(&file)).is_err(),
+                    "{file}"
+                );
+                // Environment overrides are applied before validating file bounds.
+                assert!(
+                    secured(
+                        &[("RUSTGATE_CONFIG", "settings.toml"), (&name, "2")],
+                        Some(&file),
+                    )
+                    .is_ok(),
+                    "{file}"
+                );
+            }
+            for value in ["-1", "not-an-integer", "18446744073709551616"] {
+                assert!(secured(&[(&name, value)], None).is_err(), "{field}={value}");
+            }
+        }
     }
 
     #[test]

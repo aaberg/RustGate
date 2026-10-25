@@ -1,6 +1,6 @@
 use std::{
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
@@ -21,12 +21,18 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore},
+    time::{Instant, timeout_at},
+};
 use uuid::Uuid;
 
 use crate::{
     config::Config,
     store::{InsertError, JobAdmission, JobTransition, NewJob, Store, TransitionError},
 };
+
+mod streaming;
 
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
@@ -35,6 +41,7 @@ struct ServiceState {
     store: Store,
     control_token_hash: [u8; 32],
     upstream: reqwest::Client,
+    in_flight: Arc<Semaphore>,
 }
 
 #[derive(Serialize)]
@@ -66,12 +73,14 @@ pub fn router(config: Config, store: Store) -> anyhow::Result<Router> {
     let upstream = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
+        .connect_timeout(Duration::from_secs(config.connect_timeout_seconds))
         // Egress is selected only by configuration, never environment proxies.
         .no_proxy()
         .build()
         .context("could not initialize upstream HTTP client")?;
     let state = Arc::new(ServiceState {
         control_token_hash: Sha256::digest(config.control_plane_token.as_bytes()).into(),
+        in_flight: Arc::new(Semaphore::new(config.max_in_flight_requests as usize)),
         config,
         store,
         upstream,
@@ -159,6 +168,35 @@ async fn proxy_chat(State(state): State<Arc<ServiceState>>, request: Request) ->
         return unauthorized();
     };
     let token_hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+    let permit = match state.in_flight.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            let mut response = error(StatusCode::SERVICE_UNAVAILABLE, "Proxy is at capacity");
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+            return response;
+        }
+    };
+    let deadline = Instant::now() + Duration::from_secs(state.config.overall_timeout_seconds);
+    match timeout_at(
+        deadline,
+        admitted_chat(state, request, token_hash, permit, deadline),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(_) => error(StatusCode::GATEWAY_TIMEOUT, "Overall request timed out"),
+    }
+}
+
+async fn admitted_chat(
+    state: Arc<ServiceState>,
+    request: Request,
+    token_hash: [u8; 32],
+    permit: OwnedSemaphorePermit,
+    deadline: Instant,
+) -> Response {
     let store = state.store.clone();
     let job = match tokio::task::spawn_blocking(move || store.admit_job(token_hash)).await {
         Ok(Ok(JobAdmission::Admitted(job))) => job,
@@ -203,12 +241,9 @@ async fn proxy_chat(State(state): State<Arc<ServiceState>>, request: Request) ->
     if !body.is_object()
         || body
             .get("stream")
-            .is_some_and(|stream| stream != &Value::Bool(false))
+            .is_some_and(|stream| !stream.is_boolean())
     {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "Only non-streaming chat is supported",
-        );
+        return error(StatusCode::BAD_REQUEST, "Chat stream must be a boolean");
     }
     let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         return error(StatusCode::BAD_REQUEST, "Chat messages must be an array");
@@ -223,37 +258,14 @@ async fn proxy_chat(State(state): State<Arc<ServiceState>>, request: Request) ->
 
     // Start a fresh request: no client credentials, cookies, routing headers,
     // or hop-by-hop headers cross the upstream trust boundary.
-    let response = match state
-        .upstream
-        .post(url)
-        .bearer_auth(key)
-        .json(&body)
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(_) => return error(StatusCode::BAD_GATEWAY, "Upstream request failed"),
-    };
-    let status = response.status();
-    let mut headers = HeaderMap::new();
-    for name in [
-        header::CONTENT_TYPE,
-        header::CONTENT_ENCODING,
-        header::RETRY_AFTER,
-    ] {
-        for value in response.headers().get_all(&name) {
-            headers.append(name.clone(), value.clone());
-        }
-    }
-    let body = match response.bytes().await {
-        Ok(body) => body,
-        Err(_) => return error(StatusCode::BAD_GATEWAY, "Upstream request failed"),
-    };
-    headers.insert(
-        header::CACHE_CONTROL,
-        header::HeaderValue::from_static("no-store"),
-    );
-    (status, headers, body).into_response()
+    streaming::forward(
+        state.upstream.post(url).bearer_auth(key).json(&body),
+        permit,
+        deadline,
+        Duration::from_secs(state.config.first_byte_timeout_seconds),
+        Duration::from_secs(state.config.idle_timeout_seconds),
+    )
+    .await
 }
 
 async fn revoke_job(
@@ -434,6 +446,7 @@ mod tests {
 
     mod lifecycle_tests;
     mod proxy_tests;
+    mod streaming_tests;
 
     const CONTROL_TOKEN: &str = "private-control-credential";
     const UPSTREAM_SECRET: &str = "private-upstream-key";
@@ -462,6 +475,11 @@ mod tests {
             max_requests: 10000,
             default_max_tokens_total: 2000000,
             max_tokens_total: 100000000,
+            connect_timeout_seconds: 5,
+            first_byte_timeout_seconds: 60,
+            idle_timeout_seconds: 120,
+            overall_timeout_seconds: 600,
+            max_in_flight_requests: 64,
         }
     }
 
