@@ -813,3 +813,113 @@ async fn ordinary_usage_distinguishes_known_zero_missing_and_local_rejection() {
     assert_eq!(persisted(&fixture.path)["tokens_used"], 8);
     assert_eq!(persisted(&fixture.path)["requests_used"], 5);
 }
+
+#[tokio::test]
+async fn streaming_usage_is_requested_even_when_client_disables_it() {
+    let upstream = Router::new().route(
+        "/v1/chat/completions",
+        post(|Json(body): Json<Value>| async move {
+            let options = &body["stream_options"];
+            // This provider/model rejects requests without its required option.
+            // Losing a sibling field must fail the real upstream request, not
+            // merely change a captured copy of the payload.
+            if body["model"] == "option-sensitive-model"
+                && options["include_obfuscation"] != false
+            {
+                return (StatusCode::BAD_REQUEST, Json(json!({"error":"missing model option"})))
+                    .into_response();
+            }
+            let mut wire = String::from("data: {\"choices\":[]}\n\n");
+            // Unlike the general mock, report usage only when it was requested.
+            if options["include_usage"] == true {
+                wire.push_str(
+                    "data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n\n",
+                );
+            }
+            wire.push_str("data: [DONE]\n\n");
+            ([(header::CONTENT_TYPE, "text/event-stream")], wire).into_response()
+        }),
+    );
+    let (fixture, _upstream) = fixture(upstream, "").await;
+    let token = token(&fixture).await;
+    let mut omitted = chat_body();
+    omitted["stream"] = json!(true);
+    let mut disabled = omitted.clone();
+    disabled["model"] = json!("option-sensitive-model");
+    disabled["stream_options"] = json!({"include_usage":false,"include_obfuscation":false});
+    for body in [omitted, disabled] {
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(chat(body.to_string(), Some(&token)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .unwrap();
+        wait_for_accounting(&fixture).await;
+    }
+    let observer = Connection::open(&fixture.path).unwrap();
+    let records: Vec<(String, Option<i64>)> = observer
+        .prepare("SELECT outcome, total_tokens FROM request_records ORDER BY request_id")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        records,
+        vec![
+            ("completed".to_owned(), Some(8)),
+            ("completed".to_owned(), Some(8))
+        ]
+    );
+    assert_eq!(persisted(&fixture.path)["tokens_used"], 16);
+}
+
+#[tokio::test]
+async fn non_object_stream_options_are_charged_zero_without_upstream_attempts() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let observed = attempts.clone();
+    let upstream = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async { Json(json!({"unexpected":"upstream attempt"})) }
+        }),
+    );
+    let (fixture, _upstream) = fixture(upstream, "").await;
+    let token = token(&fixture).await;
+    for options in [
+        Value::Null,
+        json!(false),
+        json!(1),
+        json!("invalid"),
+        json!([]),
+    ] {
+        let mut body = chat_body();
+        body["stream"] = json!(true);
+        body["stream_options"] = options;
+        let (status, _, error) =
+            send(fixture.app.clone(), chat(body.to_string(), Some(&token))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_private_error(&error);
+    }
+    wait_for_accounting(&fixture).await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 0);
+    let known_zero_rejections: i64 = Connection::open(&fixture.path)
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM request_records WHERE outcome = 'rejected'
+             AND prompt_tokens = 0 AND completion_tokens = 0 AND total_tokens = 0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(known_zero_rejections, 5);
+    assert_eq!(persisted(&fixture.path)["requests_used"], 5);
+    assert_eq!(persisted(&fixture.path)["tokens_used"], 0);
+}

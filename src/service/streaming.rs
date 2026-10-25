@@ -18,7 +18,7 @@ use super::{accounting::Accounting, error, usage::UsageTracker};
 /// gateway status for connection and first-byte failures.
 pub(super) async fn forward(
     request: reqwest::RequestBuilder,
-    accounting: Accounting,
+    mut accounting: Accounting,
     overall_deadline: Instant,
     first_byte_timeout: Duration,
     idle_timeout: Duration,
@@ -81,6 +81,7 @@ pub(super) async fn forward(
     // Account bytes already received even if the downstream disconnects before
     // the relay task gets its first poll.
     usage.feed(&first);
+    accounting.observe_usage(usage.observed());
     // One queued chunk plus the producer's current chunk bounds read-ahead.
     // Accounting retains only a bounded JSON body or a bounded SSE event.
     let (sender, receiver) = mpsc::channel::<Bytes>(1);
@@ -117,6 +118,7 @@ pub(super) async fn forward(
                     })?;
                     let Some(chunk) = chunk else { return Ok(()) };
                     usage.feed(&chunk);
+                    accounting.observe_usage(usage.observed());
                     sender.send(chunk).await.map_err(|_| {
                         ("disconnected", io::Error::other("Downstream disconnected"))
                     })?;

@@ -16,8 +16,10 @@ struct Pending {
     _permit: OwnedSemaphorePermit,
 }
 
-impl Pending {
-    fn reconcile(self) {
+impl Drop for Pending {
+    fn drop(&mut self) {
+        // Normally dropped on a blocking worker. If shutdown discards that
+        // worker's closure, reconcile during teardown instead of losing usage.
         if self
             .store
             .finish_request(self.request_id, self.outcome, self.usage)
@@ -52,6 +54,12 @@ impl Accounting {
         self.pending.as_mut().unwrap().usage = None;
     }
 
+    pub(super) fn observe_usage(&mut self, usage: Option<Usage>) {
+        // The relay can be cancelled at its next await. Keep its latest
+        // complete report in the guard that owns cancellation reconciliation.
+        self.pending.as_mut().unwrap().usage = usage;
+    }
+
     pub(super) async fn finish(self, outcome: &'static str, usage: Option<Usage>) {
         let _ = self.finish_worker(outcome, usage).await;
     }
@@ -70,7 +78,7 @@ impl Accounting {
         pending.usage = usage;
         // Configure the terminal outcome and transfer ownership synchronously,
         // before a response can return or runtime shutdown cancels async tasks.
-        tokio::task::spawn_blocking(move || pending.reconcile())
+        tokio::task::spawn_blocking(move || drop(pending))
     }
 
     pub(super) async fn reject(self) {
@@ -84,7 +92,7 @@ impl Drop for Accounting {
         if let Some(pending) = self.pending.take() {
             // A dropped JoinHandle's output can be destroyed on the admission
             // worker itself. Runtime handles are available on blocking workers.
-            tokio::task::spawn_blocking(move || pending.reconcile());
+            tokio::task::spawn_blocking(move || drop(pending));
         }
     }
 }

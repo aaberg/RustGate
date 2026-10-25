@@ -889,3 +889,132 @@ fn background_finalization_keeps_timeout_outcome_when_runtime_shuts_down_immedia
     assert_eq!(accounting_record(&fixture), ("timeout".to_owned(), None));
     assert_eq!(persisted(&fixture.path)["requests_used"], 1);
 }
+
+fn shutdown_after_observed_stream(
+    first: &'static [u8],
+    later: Option<&'static [u8]>,
+    expected: Option<i64>,
+) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (fixture, _server, _chunks, _body) = runtime.block_on(async {
+        let (fixture, server, chunks, _captures) = fixture(|_| {}).await;
+        let token = token(&fixture).await;
+        chunks.send(Ok(Bytes::from_static(first))).await.unwrap();
+        let response = bounded(fixture.app.clone().oneshot(chat(payload(), &token)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        assert_eq!(bounded(body.next()).await.unwrap().unwrap().as_ref(), first);
+        if let Some(later) = later {
+            chunks.send(Ok(Bytes::from_static(later))).await.unwrap();
+            assert_eq!(bounded(body.next()).await.unwrap().unwrap().as_ref(), later);
+        }
+        assert_eq!(accounting_record(&fixture), ("pending".to_owned(), None));
+        // Keep upstream and downstream open outside block_on. The runtime,
+        // rather than a disconnect or EOF, must cancel the unfinished relay.
+        (fixture, server, chunks, body)
+    });
+    drop(runtime);
+    assert_eq!(
+        accounting_record(&fixture),
+        ("cancelled".to_owned(), expected)
+    );
+    assert_eq!(
+        persisted(&fixture.path)["tokens_used"],
+        expected.unwrap_or(0)
+    );
+    assert_eq!(persisted(&fixture.path)["requests_used"], 1);
+}
+
+#[test]
+fn runtime_shutdown_preserves_usage_in_first_stream_chunk() {
+    shutdown_after_observed_stream(
+        b"data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n\n",
+        None,
+        Some(8),
+    );
+}
+
+#[test]
+fn runtime_shutdown_preserves_usage_in_later_stream_chunk() {
+    shutdown_after_observed_stream(
+        b"data: {\"choices\":[]}\n\n",
+        Some(b"data: {\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":5,\"total_tokens\":13}}\n\n"),
+        Some(13),
+    );
+}
+
+#[test]
+fn runtime_shutdown_counts_latest_complete_report_once() {
+    shutdown_after_observed_stream(
+        b"data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n\n",
+        Some(b"data: {\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":5,\"total_tokens\":13}}\n\n"),
+        Some(13),
+    );
+}
+
+#[test]
+fn runtime_shutdown_keeps_last_complete_usage_before_partial_report() {
+    shutdown_after_observed_stream(
+        b"data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n\n",
+        Some(b"data: {\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":5,\"total_tokens\":13}}\n"),
+        Some(8),
+    );
+}
+
+#[test]
+fn runtime_shutdown_leaves_incomplete_usage_unknown() {
+    shutdown_after_observed_stream(
+        b"data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n",
+        None,
+        None,
+    );
+}
+
+#[test]
+fn rejected_shutdown_worker_still_persists_observed_usage() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let handle = runtime.handle().clone();
+    let (fixture, accounting, capacity) = runtime.block_on(async {
+        let fixture = Fixture::new();
+        let token = token(&fixture).await;
+        let store = Store::open(&fixture.path).unwrap();
+        let JobAdmission::Admitted(job) = store
+            .admit_job(Sha256::digest(token.as_bytes()).into())
+            .unwrap()
+        else {
+            panic!("request was not admitted");
+        };
+        let capacity = Arc::new(Semaphore::new(1));
+        let mut accounting = accounting::Accounting::new(
+            store,
+            job.request_id,
+            capacity.clone().try_acquire_owned().unwrap(),
+        );
+        accounting.dispatched();
+        accounting.observe_usage(Some(crate::store::Usage {
+            prompt_tokens: 5,
+            completion_tokens: 3,
+            total_tokens: 8,
+        }));
+        (fixture, accounting, capacity)
+    });
+    drop(runtime);
+    // Model relay cancellation after the blocking pool has closed: the
+    // finalizer's queued closure is discarded without ever being executed.
+    let _entered = handle.enter();
+    drop(accounting);
+    assert_eq!(
+        accounting_record(&fixture),
+        ("cancelled".to_owned(), Some(8))
+    );
+    assert_eq!(persisted(&fixture.path)["tokens_used"], 8);
+    assert_eq!(capacity.available_permits(), 1);
+}
