@@ -179,6 +179,7 @@ async fn first_byte_deadline_includes_headers_without_body_and_does_not_retry() 
     bounded(chunks.closed()).await;
     assert!(captures.try_recv().is_err());
     assert_eq!(persisted(&fixture.path)["requests_used"], 1);
+    assert_eq!(accounting_record(&fixture), ("timeout".to_owned(), None));
 }
 
 #[tokio::test]
@@ -210,6 +211,7 @@ async fn idle_deadline_after_commit_is_a_transport_error_not_an_sse_event() {
     bounded(captures.recv()).await.unwrap();
     assert!(captures.try_recv().is_err());
     assert_eq!(persisted(&fixture.path)["requests_used"], 1);
+    assert_eq!(accounting_record(&fixture), ("timeout".to_owned(), None));
 }
 
 #[tokio::test]
@@ -521,6 +523,10 @@ fn blocked_admission_retains_capacity(timeout: bool) {
         // The abandoned admission still charges once, but never forwards. Only
         // the subsequent malformed request consumes another slot after recovery.
         assert_eq!(persisted(&fixture.path)["requests_used"], 2);
+        assert_eq!(
+            accounting_record(&fixture),
+            ("cancelled".to_owned(), Some(0))
+        );
         assert!(captures.try_recv().is_err());
     });
 }
@@ -533,4 +539,145 @@ fn cancelled_blocking_admission_remains_in_flight_until_worker_finishes() {
 #[test]
 fn timed_out_blocking_admission_remains_in_flight_until_worker_finishes() {
     blocked_admission_retains_capacity(true);
+}
+
+fn accounting_record(fixture: &Fixture) -> (String, Option<i64>) {
+    Connection::open(&fixture.path)
+        .unwrap()
+        .query_row(
+            "SELECT outcome, total_tokens FROM request_records ORDER BY request_id LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+}
+
+#[tokio::test]
+async fn streaming_usage_reconciles_after_done_without_double_counting_reports() {
+    let (fixture, _server, chunks, mut captures) = fixture(|_| {}).await;
+    let token = token(&fixture).await;
+    let pending = tokio::spawn(fixture.app.clone().oneshot(chat(payload(), &token)));
+    bounded(captures.recv()).await.unwrap();
+    chunks
+        .send(Ok(Bytes::from_static(b"data: {\"usage\":null}\n\n")))
+        .await
+        .unwrap();
+    let response = bounded(pending).await.unwrap().unwrap();
+    let mut body = response.into_body().into_data_stream();
+    bounded(body.next()).await.unwrap().unwrap();
+    assert_eq!(accounting_record(&fixture), ("pending".to_owned(), None));
+    let mut done = request(Body::empty(), Some(CONTROL_TOKEN));
+    *done.uri_mut() = format!("/v1/jobs/{JOB_ID}/done").parse().unwrap();
+    assert_eq!(
+        fixture.app.clone().oneshot(done).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    let report =
+        b"data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n\n";
+    // Cumulative duplicate reports must not charge twice; frame boundaries need
+    // not match transport chunks.
+    for part in [
+        &report[..17],
+        &report[17..],
+        &report[..],
+        b"data: [DONE]\n\n",
+    ] {
+        chunks.send(Ok(Bytes::copy_from_slice(part))).await.unwrap();
+        bounded(body.next()).await.unwrap().unwrap();
+    }
+    drop(chunks);
+    assert!(bounded(body.next()).await.is_none());
+    assert_eq!(
+        accounting_record(&fixture),
+        ("completed".to_owned(), Some(8))
+    );
+    assert_eq!(persisted(&fixture.path)["tokens_used"], 8);
+    assert_eq!(persisted(&fixture.path)["status"], "done");
+}
+
+#[tokio::test]
+async fn broken_stream_usage_is_unknown_unless_a_complete_report_was_received() {
+    for known in [false, true] {
+        let (fixture, _server, chunks, mut captures) = fixture(|_| {}).await;
+        let token = token(&fixture).await;
+        let pending = tokio::spawn(fixture.app.clone().oneshot(chat(payload(), &token)));
+        bounded(captures.recv()).await.unwrap();
+        let first = if known {
+            b"data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n\n".as_slice()
+        } else {
+            b"data: {\"usage\":{\"prompt_tokens\":5,".as_slice()
+        };
+        chunks
+            .send(Ok(Bytes::copy_from_slice(first)))
+            .await
+            .unwrap();
+        let response = bounded(pending).await.unwrap().unwrap();
+        let mut body = response.into_body().into_data_stream();
+        assert_eq!(bounded(body.next()).await.unwrap().unwrap().as_ref(), first);
+        chunks
+            .send(Err(io::Error::other("controlled broken stream")))
+            .await
+            .unwrap();
+        assert!(bounded(body.next()).await.unwrap().is_err());
+        assert_eq!(
+            accounting_record(&fixture),
+            (
+                "upstream_error".to_owned(),
+                if known { Some(8) } else { None }
+            )
+        );
+        assert_eq!(
+            persisted(&fixture.path)["tokens_used"],
+            if known { 8 } else { 0 }
+        );
+    }
+}
+
+#[tokio::test]
+async fn disconnect_reconciles_unknown_usage_and_releases_capacity() {
+    let (fixture, _server, chunks, mut captures) = fixture(|settings| {
+        settings.max_in_flight_requests = 1;
+    })
+    .await;
+    let token = token(&fixture).await;
+    let pending = tokio::spawn(fixture.app.clone().oneshot(chat(payload(), &token)));
+    bounded(captures.recv()).await.unwrap();
+    chunks
+        .send(Ok(Bytes::from_static(b"data: {\"choices\":[]}\n\n")))
+        .await
+        .unwrap();
+    let response = bounded(pending).await.unwrap().unwrap();
+    drop(response);
+    bounded(chunks.closed()).await;
+    recovered(&fixture, &token).await;
+    assert_eq!(
+        accounting_record(&fixture),
+        ("disconnected".to_owned(), None)
+    );
+    assert_eq!(persisted(&fixture.path)["tokens_used"], 0);
+}
+
+#[tokio::test]
+async fn usage_in_first_upstream_chunk_survives_disconnect_before_body_polling() {
+    let (fixture, _server, chunks, _captures) = fixture(|settings| {
+        settings.max_in_flight_requests = 1;
+    })
+    .await;
+    let token = token(&fixture).await;
+    chunks.send(Ok(Bytes::from_static(
+        b"data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n\n"
+    ))).await.unwrap();
+    // Await the handler directly on this current-thread runtime. The response
+    // is dropped before the newly spawned relay can be scheduled.
+    let response = bounded(fixture.app.clone().oneshot(chat(payload(), &token)))
+        .await
+        .unwrap();
+    drop(response);
+    bounded(chunks.closed()).await;
+    recovered(&fixture, &token).await;
+    assert_eq!(
+        accounting_record(&fixture),
+        ("disconnected".to_owned(), Some(8))
+    );
+    assert_eq!(persisted(&fixture.path)["tokens_used"], 8);
 }

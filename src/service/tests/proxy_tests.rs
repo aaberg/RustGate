@@ -158,7 +158,9 @@ async fn inactive_expired_missing_keys_and_storage_failures_never_forward() {
         StatusCode::UNAUTHORIZED
     );
     assert_eq!(persisted(&fixture.path)["requests_used"], 1);
-    connection.execute_batch("DROP TABLE jobs").unwrap();
+    connection
+        .execute_batch("DROP TABLE request_records; DROP TABLE jobs")
+        .unwrap();
     let (status, _, body) = send(fixture.app, chat(chat_body().to_string(), Some(&token))).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_private_error(&body);
@@ -685,7 +687,7 @@ async fn concurrent_admissions_stop_at_the_persisted_allowance_across_restart() 
     assert_eq!(captures(mock.clone()).await.as_array().unwrap().len(), 5);
     let charged = persisted(&fixture.path);
     assert_eq!(charged["requests_used"], 5);
-    assert_eq!(charged["tokens_used"], 0);
+    assert_eq!(charged["tokens_used"], 40);
     assert_eq!(charged["status"], "exhausted");
 
     // Exhaustion remains the first terminal state even once its TTL passes.
@@ -746,4 +748,61 @@ async fn admitted_invalid_requests_consume_the_entire_allowance_without_forwardi
     assert_exhausted(status, &headers, &body);
     assert_eq!(persisted(&fixture.path), exhausted);
     assert_eq!(captures(mock).await, json!([]));
+}
+
+#[tokio::test]
+async fn ordinary_usage_distinguishes_known_zero_missing_and_local_rejection() {
+    let upstream = Router::new().route(
+        "/v1/chat/completions",
+        post(|Json(body): Json<Value>| async move {
+            match body["model"].as_str().unwrap() {
+                "known" => Json(json!({"usage":{
+                    "prompt_tokens":5,"completion_tokens":3,"total_tokens":8
+                }})),
+                "zero" => Json(json!({"usage":{
+                    "prompt_tokens":0,"completion_tokens":0,"total_tokens":0
+                }})),
+                "malformed" => Json(json!({"usage":{
+                    "prompt_tokens":5,"completion_tokens":3,"total_tokens":99
+                }})),
+                _ => Json(json!({"choices":[]})),
+            }
+        }),
+    );
+    let (fixture, _upstream) = fixture(upstream, "").await;
+    let token = token(&fixture).await;
+    for model in ["known", "zero", "missing", "malformed"] {
+        let mut body = chat_body();
+        body["model"] = json!(model);
+        assert_eq!(
+            send(fixture.app.clone(), chat(body.to_string(), Some(&token)))
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        send(fixture.app.clone(), chat("{", Some(&token))).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    let observer = Connection::open(&fixture.path).unwrap();
+    let records: Vec<(String, Option<i64>)> = observer
+        .prepare("SELECT outcome, total_tokens FROM request_records ORDER BY request_id")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        records,
+        vec![
+            ("completed".to_owned(), Some(8)),
+            ("completed".to_owned(), Some(0)),
+            ("completed".to_owned(), None),
+            ("completed".to_owned(), None),
+            ("rejected".to_owned(), Some(0)),
+        ]
+    );
+    assert_eq!(persisted(&fixture.path)["tokens_used"], 8);
+    assert_eq!(persisted(&fixture.path)["requests_used"], 5);
 }
