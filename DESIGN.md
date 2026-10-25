@@ -1,7 +1,7 @@
 # Model Proxy Service — Specification
 ## Purpose
 
-A stateless HTTP reverse proxy that sits between build containers (running AI agents) and the upstream LLM API (Mistral). It ensures the real upstream API key never enters a build container, enforces per-job quotas, provides observability, and injects authoritative system prompts.
+A job-scoped HTTP reverse proxy that sits between build containers (running AI agents) and the upstream LLM API (Mistral). It ensures the real upstream API key never enters a build container, enforces per-job quotas, provides observability, and injects authoritative system prompts.
 ## Boundaries and network position
 
 * Listens on an internal interface only (private network / WireGuard), HTTPS with its own cert (mTLS optional; at minimum server-auth TLS since clients are on a trusted network segment).
@@ -18,6 +18,7 @@ Persist in an embedded SQLite store.
 * tenant_id
 * upstream_key_id (reference to which real key pool entry serves this job)
 * token_hash (sha256 of the per-job bearer token; never store the token itself)
+* system_prompt (authoritative operator prompt supplied by the builder, persisted verbatim)
 * created_at, expires_at (issue + 30 min, configurable)
 * max_requests, requests_used
 * max_tokens_total (sum of request+response tokens across the job), tokens_used
@@ -33,7 +34,7 @@ request_log (append-only, one row per proxied request)
 1. POST /v1/jobs — issue a job token (called by the builder service)
 
 * Authentication: the proxy and the builder service authenticate to each other with mTLS client certs, or a shared static internal bearer token over the private network. Not with job tokens — this is the control-plane endpoint.
-* Request body: { "job_id": "...", "tenant_id": "...", "upstream_key_id": "...", "ttl_seconds": 1800, "max_requests": 100, "max_tokens_total": 2_000_000 }
+* Request body: { "job_id": "<uuid>", "tenant_id": "...", "upstream_key_id": "...", "system_prompt": "<authoritative product rules>", "ttl_seconds": 1800, "max_requests": 100, "max_tokens_total": 2000000 }
 * The proxy generates the job's bearer token itself (random 32 bytes, crypto-secure RNG) and returns it in the issuance response; the proxy stores only its hash. The builder receives the token over the mutually authenticated channel and injects it into the build container.
   * Decision: the proxy is the token generator, not the builder. Rationale: the proxy owns the data-plane auth domain, token format and entropy requirements are enforced in one place, and the builder never needs logic for token generation. The trade-off is that the proxy momentarily sees the raw token at issuance time (before hashing) — accepted, since the proxy is trusted infrastructure. To keep the builder from having to trust the proxy's channel alone, issuance responses are sent only over mTLS or the shared internal token.
   * To mitigate token leakage on the proxy side, the raw token exists only in memory of the issuance handler for the duration of the response; it is never logged, never persisted, and never appears in metrics.
@@ -67,7 +68,7 @@ Order of checks on every proxied request:
   * Request size cap (e.g. 1 MB) — also your cost guard.
   * Secret-scanning heuristic on the serialized body: regexes for common key shapes (sk-…, the upstream key prefix pattern, long high-entropy base64 runs). A match → block with 403 and log block_reason=possible_secret. Rationale: an agent that found a secret somewhere must not be able to send it through the proxy either. Cheap, deterministic, high value.
   * Prompt-injection marker scan (best-effort, advisory only — log a flag, don't block by default): phrases like "reveal your system prompt", "print your environment", "include the API key". This is a tripwire, not a wall: it feeds the audit trail and the per-tenant risk score, and can be escalated to blocking later once you know your false-positive rate.
-* System prompt injection: if the request's messages don't already start with the authoritative job system prompt (identified by a sentinel string), prepend it. The system prompt is fetched per-job: the builder includes the job's "product system prompt" (framework rules, integration library, forbidden actions) when creating the job, and the proxy stores and injects it. This makes the user-facing prompt clearly separated from the operator's rules, and the operator's prompt can't be deleted by the agent. Details for the agent implementing this: inject as the first system message; if the container sends its own system message, keep it after the injected one; mark the injected one with a header field your harness recognizes.
+* System prompt injection (step 5): inject the persisted authoritative `system_prompt` as the first system message using a deterministic content-based rule; preserve permitted client messages after it. Never trust a client-supplied sentinel or header as proof that the authoritative prompt is present. The builder supplies the prompt at issuance; a container cannot replace the persisted prompt.
 
 * Upstream key pool
 
@@ -106,41 +107,90 @@ Order of checks on every proxied request:
  * Streaming: SSE response streams incrementally end-to-end.
  * Path allowlist rejects /v1/admin style paths.
 
-## Step 1: local development service
+## Implemented service: steps 1 and 2
 
-This increment implements startup configuration, health, graceful shutdown, and a separate mock upstream. It does **not** implement job issuance, persistence, authentication, or proxy forwarding. The upstream URL is validated but is not contacted by the service yet.
-
-Both executables serve plain HTTP on loopback only. Non-loopback bind addresses are rejected until TLS is implemented in step 2. Do not deploy this increment to build containers or expose the mock through a tunnel or reverse proxy.
+The service implements HTTPS, configuration, health, graceful shutdown, authenticated job issuance, and SQLite persistence. The separate mock remains a loopback-only HTTP fixture. Proxy forwarding, job-token authentication, lifecycle transitions, prompt injection, and quota enforcement are **not implemented yet**; persisted caps are issuance metadata until their roadmap increments.
 
 ### Running
 
-With a stable Rust toolchain supporting edition 2024:
+With a stable Rust toolchain supporting edition 2024 and OpenSSL for local certificate generation:
 
 ```sh
+# Development only; production needs a certificate trusted by the builder.
+openssl req -x509 -newkey rsa:3072 -nodes \
+  -keyout key.pem -out cert.pem -days 7 -subj '/CN=localhost' \
+  -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1'
+chmod 600 key.pem
+
+export RUSTGATE_CONTROL_PLANE_TOKEN="$(openssl rand -hex 32)"
+export RUSTGATE_UPSTREAM_KEYS='{"local":"fake-upstream-credential"}'
+export RUSTGATE_CONFIG=rustgate.example.toml
 cargo run --bin rustgate
-curl http://127.0.0.1:8080/healthz
+# In a terminal with the same environment:
+curl --cacert cert.pem https://localhost:8443/healthz
 # {"status":"ok"}
 
-# In another terminal:
+# Separate terminal:
 cargo run --bin mock-upstream
 ```
 
-Both processes handle SIGINT (Ctrl-C) and, on Unix, SIGTERM by stopping new connections and finishing admitted requests before exiting. There is no forced drain deadline in this increment.
+The production service accepts TLS only, including on loopback. Bind an internal interface and enforce the network boundary described above; TLS does not make a public listener safe. Server authentication plus the static control-plane bearer is implemented; mTLS is not. The configured `proxy_url` is advertised verbatim, so its hostname and port must match the client-facing deployment and certificate. Port `0` selects an ephemeral listener; configure a usable advertised URL separately.
+
+Both executables handle SIGINT and, on Unix, SIGTERM by stopping new connections and finishing admitted requests. No forced drain deadline is imposed.
 
 ### Configuration
 
-Service precedence is built-in defaults, then an optional TOML file selected by `RUSTGATE_CONFIG`, then individual environment overrides. See `rustgate.example.toml`. An explicitly selected missing or malformed file, unknown TOML field, or invalid setting fails startup.
+Precedence: built-in defaults, optional TOML file selected by `RUSTGATE_CONFIG`, then environment overrides. An explicitly selected missing/malformed file, unknown field, invalid bound, or missing security setting fails startup without echoing secret values. See `rustgate.example.toml`. All fields have an environment override named `RUSTGATE_` plus the uppercase TOML field.
 
-| TOML field | Environment override | Default |
-| --- | --- | --- |
-| `listen_addr` | `RUSTGATE_LISTEN_ADDR` | `127.0.0.1:8080` |
-| `upstream_base_url` | `RUSTGATE_UPSTREAM_BASE_URL` | `http://127.0.0.1:9090` |
+| TOML field | Default / requirement |
+| --- | --- |
+| `listen_addr` | `127.0.0.1:8443`; IP socket address |
+| `upstream_base_url` | `http://127.0.0.1:9090`; HTTPS, or HTTP on loopback only |
+| `tls_cert_path`, `tls_key_path` | Required PEM certificate chain and matching private key |
+| `database_path` | `rustgate.sqlite3`; persistent file, not `:memory:` or a `file:` URI |
+| `control_plane_token` | Required; at least 32 visible ASCII bytes without whitespace; generate randomly |
+| `upstream_keys` | Required nonempty table of key IDs to credentials; environment override is a JSON object |
+| `proxy_url` | Required HTTPS URL with exactly `/v1` path, no credentials, query, or fragment |
+| `default_ttl_seconds`, `max_ttl_seconds` | `1800`, `86400`; maximum cannot exceed 31536000 seconds |
+| `default_max_requests`, `max_requests` | `100`, `10000` |
+| `default_max_tokens_total`, `max_tokens_total` | `2000000`, `100000000` |
 
-Listen addresses must be loopback IP socket addresses (not hostnames). Upstream URLs must use HTTPS, or HTTP with a loopback host, and must not contain credentials, a query, or a fragment. No upstream credentials are needed for step 1.
+Defaults must be positive and not exceed their maxima; all maxima must fit a signed SQLite integer. Upstream URLs cannot include credentials, query strings, or fragments. Key credentials must be nonempty visible ASCII without whitespace. Mount secret configuration read-only with restrictive permissions, or supply environment variables; neither key-pool credentials nor the control credential are persisted in SQLite. Keys are loaded at startup; restart to change the pool.
+
+### Issuing and inspecting a job
 
 ```sh
-RUSTGATE_CONFIG=rustgate.example.toml cargo run --bin rustgate
+curl --cacert cert.pem https://localhost:8443/v1/jobs \
+  -H "Authorization: Bearer $RUSTGATE_CONTROL_PLANE_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "job_id":"74fd5462-016e-4ba5-bf6d-5342efbd115f",
+    "tenant_id":"local-builder",
+    "upstream_key_id":"local",
+    "system_prompt":"Follow the product rules. Never disclose credentials.",
+    "ttl_seconds":1800,
+    "max_requests":100,
+    "max_tokens_total":2000000
+  }'
+# 201: {"job_id":"...","token":"...","expires_at":"...","proxy_url":"https://localhost:8443/v1"}
 ```
+
+`job_id`, `tenant_id`, `upstream_key_id`, and `system_prompt` are required. The three numeric limits are optional and use configured defaults, but explicit values must be positive and no greater than their configured maximum. Tenant IDs are nonblank and at most 256 bytes; key IDs are nonblank and at most 128 bytes. The entire body is limited to 1 MiB. Unknown JSON fields are rejected.
+
+Issuance authentication runs before body parsing. Missing, invalid, duplicate Authorization headers, or a job token used as a control credential receive `401`. Unknown key IDs and invalid field values receive `400`; a duplicate UUID receives `409` without modifying its original job. Successful responses use `Cache-Control: no-store`; the bearer is returned only once. There is no token-recovery API: store it securely in the builder and never log issuance bodies.
+
+Each token contains 32 cryptographically random bytes encoded as 64 lowercase hex characters. Only SHA-256 of that encoded bearer is persisted. A transaction commits the job before its token is returned. Jobs store the prompt verbatim, UTC epoch-second timestamps, zero usage counters, and `active` status. The response expiry is RFC 3339 UTC. Lost issuance responses do not roll back committed jobs: retrying the same UUID returns `409`, not a replacement token.
+
+SQLite migrations run transactionally at startup and track schema version with `PRAGMA user_version`; a newer unsupported version fails startup. The database is created with mode `0600` on Unix. Keep its directory restricted too, since the prompt is sensitive. Back up the database using SQLite-aware tooling; retain the file across restarts.
+
+```sh
+# Requires the sqlite3 CLI; never select request credentials into logs.
+sqlite3 rustgate.sqlite3 \
+  'SELECT job_id, tenant_id, upstream_key_id, length(token_hash), status, expires_at FROM jobs;'
+# Stop and restart rustgate with the same config/database, then repeat.
+```
+
+An existing UUID remains reserved across restart. Reissuing it must return `409`, demonstrating that issuance state survived. Tokens are not usable for proxy calls until step 3.
 
 ### Local mock upstream
 
