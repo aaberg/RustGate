@@ -41,10 +41,9 @@ struct CapturedRequest {
     body: Value,
 }
 
-#[derive(Clone, Copy, Default, Deserialize)]
+#[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Mode {
-    #[default]
     Normal,
     Delayed,
     Sse,
@@ -54,7 +53,7 @@ enum Mode {
 #[derive(Deserialize)]
 struct Controls {
     #[serde(default)]
-    mode: Mode,
+    mode: Option<Mode>,
     #[serde(default = "default_delay_ms")]
     delay_ms: u64,
 }
@@ -113,6 +112,16 @@ async fn chat_completions(
         return error.into_response();
     }
 
+    // Match real chat providers without requiring client-specific query support.
+    // Explicit fixture modes still override the requested response format.
+    let mode = controls.mode.unwrap_or_else(|| {
+        if body.get("stream") == Some(&Value::Bool(true)) {
+            Mode::Sse
+        } else {
+            Mode::Normal
+        }
+    });
+
     state
         .capture(CapturedRequest {
             method: method.to_string(),
@@ -124,7 +133,7 @@ async fn chat_completions(
         })
         .await;
 
-    match controls.mode {
+    match mode {
         Mode::Normal => Json(completion()).into_response(),
         Mode::Delayed => {
             tokio::time::sleep(Duration::from_millis(controls.delay_ms)).await;
@@ -231,6 +240,77 @@ mod tests {
             let uri = format!("/v1/chat/completions?{query}").parse().unwrap();
             let Query(controls) = Query::<Controls>::try_from_uri(&uri).unwrap();
             assert!(controls.validate().is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn response_format_honors_stream_body_with_explicit_mode_precedence() {
+        use axum::{body::to_bytes, http::Request};
+        use tower::ServiceExt;
+
+        for (query, body, streaming) in [
+            ("delay_ms=0", json!({"stream": true}), true),
+            ("", json!({"stream": false}), false),
+            ("", json!({}), false),
+            ("mode=normal", json!({"stream": true}), false),
+            ("mode=sse&delay_ms=0", json!({"stream": false}), true),
+        ] {
+            let response = router()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/v1/chat/completions?{query}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let expected_type = if streaming {
+                "text/event-stream"
+            } else {
+                "application/json"
+            };
+            assert!(
+                response.headers()[header::CONTENT_TYPE]
+                    .to_str()
+                    .unwrap()
+                    .starts_with(expected_type),
+                "wrong response format for {query}, body {body}"
+            );
+            let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
+                .await
+                .unwrap();
+            if streaming {
+                let text = std::str::from_utf8(&bytes).unwrap();
+                let mut events: Vec<_> = text
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .collect();
+                assert_eq!(events.pop(), Some("[DONE]"));
+                let chunks: Vec<Value> = events
+                    .into_iter()
+                    .map(|event| serde_json::from_str(event).unwrap())
+                    .collect();
+                let choices: Vec<_> = chunks
+                    .iter()
+                    .flat_map(|chunk| chunk["choices"].as_array().unwrap())
+                    .collect();
+                let content: String = choices
+                    .iter()
+                    .filter_map(|choice| choice["delta"]["content"].as_str())
+                    .collect();
+                assert_eq!(content, "Hello from mock.");
+                assert_eq!(choices.last().unwrap()["finish_reason"], "stop");
+            } else {
+                let completion: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(
+                    completion["choices"][0]["message"]["content"],
+                    "Hello from mock."
+                );
+                assert_eq!(completion["choices"][0]["finish_reason"], "stop");
+            }
         }
     }
 
