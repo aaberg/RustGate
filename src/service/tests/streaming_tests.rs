@@ -238,6 +238,98 @@ async fn sse_chunks_arrive_before_eof_with_authoritative_prompt_and_no_buffering
     assert!(captures.try_recv().is_err());
 }
 
+async fn precommit_error_precedes_contended_accounting(transport_error: bool) {
+    let (fixture, _server, chunks, mut captures) = fixture(|settings| {
+        settings.max_in_flight_requests = 1;
+        settings.first_byte_timeout_seconds = 2;
+    })
+    .await;
+    let token = token(&fixture).await;
+    let pending = tokio::spawn(send(fixture.app.clone(), chat(payload(), &token)));
+    // Capture proves admission has committed; no upstream body byte is released.
+    bounded(captures.recv()).await.unwrap();
+    let writer = Connection::open(&fixture.path).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert_eq!(accounting_record(&fixture), ("pending".to_owned(), None));
+    if transport_error {
+        chunks
+            .send(Err(io::Error::other("controlled pre-first-byte failure")))
+            .await
+            .unwrap();
+    }
+    let (status, headers, body) = tokio::time::timeout(Duration::from_secs(4), pending)
+        .await
+        .expect("pre-commit error waited for the SQLite writer")
+        .unwrap();
+    assert_eq!(
+        status,
+        if transport_error {
+            StatusCode::BAD_GATEWAY
+        } else {
+            StatusCode::GATEWAY_TIMEOUT
+        }
+    );
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    assert_private_error(&body);
+    assert_eq!(
+        body["error"]["message"],
+        if transport_error {
+            "Upstream request failed"
+        } else {
+            "Upstream request timed out"
+        }
+    );
+    bounded(chunks.closed()).await;
+    assert_eq!(accounting_record(&fixture), ("pending".to_owned(), None));
+    assert_eq!(persisted(&fixture.path)["tokens_used"], 0);
+    let (status, headers, error) =
+        bounded(send(fixture.app.clone(), chat(payload(), &token))).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(headers[header::RETRY_AFTER], "1");
+    assert_private_error(&error);
+    assert_eq!(persisted(&fixture.path)["requests_used"], 1);
+    assert!(captures.try_recv().is_err());
+
+    writer.execute_batch("COMMIT").unwrap();
+    wait_for_accounting(&fixture).await;
+    assert_eq!(
+        accounting_record(&fixture),
+        (
+            if transport_error {
+                "upstream_error"
+            } else {
+                "timeout"
+            }
+            .to_owned(),
+            None
+        )
+    );
+    let usage: (Option<i64>, Option<i64>, Option<i64>) = writer
+        .query_row(
+            "SELECT prompt_tokens, completion_tokens, total_tokens
+             FROM request_records ORDER BY request_id LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(usage, (None, None, None));
+    recovered(&fixture, &token).await;
+    assert_eq!(persisted(&fixture.path)["requests_used"], 2);
+    assert_eq!(persisted(&fixture.path)["tokens_used"], 0);
+    bounded(captures.recv()).await.unwrap();
+    assert!(captures.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn first_byte_timeout_returns_while_sqlite_writer_holds_accounting() {
+    precommit_error_precedes_contended_accounting(false).await;
+}
+
+#[tokio::test]
+async fn pre_first_byte_transport_error_returns_while_sqlite_writer_holds_accounting() {
+    precommit_error_precedes_contended_accounting(true).await;
+}
+
 #[tokio::test]
 async fn first_byte_deadline_includes_headers_without_body_and_does_not_retry() {
     let (fixture, _server, chunks, mut captures) = fixture(|settings| {
@@ -255,6 +347,7 @@ async fn first_byte_deadline_includes_headers_without_body_and_does_not_retry() 
     bounded(chunks.closed()).await;
     assert!(captures.try_recv().is_err());
     assert_eq!(persisted(&fixture.path)["requests_used"], 1);
+    wait_for_accounting(&fixture).await;
     assert_eq!(accounting_record(&fixture), ("timeout".to_owned(), None));
 }
 
@@ -542,6 +635,8 @@ async fn connect_deadline_includes_tls_handshake_without_retrying() {
     assert_private_error(&body);
     assert_eq!(connections.load(Ordering::SeqCst), 1);
     assert_eq!(persisted(&fixture.path)["requests_used"], 1);
+    wait_for_accounting(&fixture).await;
+    assert_eq!(accounting_record(&fixture), ("timeout".to_owned(), None));
 }
 
 fn blocked_admission_retains_capacity(timeout: bool) {
@@ -760,4 +855,37 @@ async fn usage_in_first_upstream_chunk_survives_disconnect_before_body_polling()
         ("disconnected".to_owned(), Some(8))
     );
     assert_eq!(persisted(&fixture.path)["tokens_used"], 8);
+}
+
+#[test]
+fn background_finalization_keeps_timeout_outcome_when_runtime_shuts_down_immediately() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let fixture = runtime.block_on(async {
+        let fixture = Fixture::new();
+        let token = token(&fixture).await;
+        let store = Store::open(&fixture.path).unwrap();
+        let JobAdmission::Admitted(job) = store
+            .admit_job(Sha256::digest(token.as_bytes()).into())
+            .unwrap()
+        else {
+            panic!("request was not admitted");
+        };
+        let capacity = Arc::new(Semaphore::new(1));
+        let mut accounting = accounting::Accounting::new(
+            store,
+            job.request_id,
+            capacity.try_acquire_owned().unwrap(),
+        );
+        accounting.dispatched();
+        accounting.finish_in_background("timeout", None);
+        // No executor yield after dispatch: an intermediate async task could be
+        // cancelled before it transfers the intended outcome to a worker.
+        fixture
+    });
+    drop(runtime);
+    assert_eq!(accounting_record(&fixture), ("timeout".to_owned(), None));
+    assert_eq!(persisted(&fixture.path)["requests_used"], 1);
 }

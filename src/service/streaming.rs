@@ -38,15 +38,15 @@ pub(super) async fn forward(
     let (response, first) = match first {
         Ok(Ok(response)) => response,
         Ok(Err(failure)) if failure.is_timeout() => {
-            accounting.finish("timeout", None).await;
+            accounting.finish_in_background("timeout", None);
             return error(StatusCode::GATEWAY_TIMEOUT, "Upstream request timed out");
         }
         Ok(Err(_)) => {
-            accounting.finish("upstream_error", None).await;
+            accounting.finish_in_background("upstream_error", None);
             return error(StatusCode::BAD_GATEWAY, "Upstream request failed");
         }
         Err(_) => {
-            accounting.finish("timeout", None).await;
+            accounting.finish_in_background("timeout", None);
             return error(StatusCode::GATEWAY_TIMEOUT, "Upstream request timed out");
         }
     };
@@ -75,7 +75,7 @@ pub(super) async fn forward(
 
     let Some(first) = first else {
         drop(response);
-        tokio::spawn(accounting.finish(completed, usage.finish()));
+        accounting.finish_in_background(completed, usage.finish());
         return (status, headers, Body::empty()).into_response();
     };
     // Account bytes already received even if the downstream disconnects before

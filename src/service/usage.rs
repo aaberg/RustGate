@@ -90,8 +90,9 @@ fn is_json_media_type(value: &str) -> bool {
 
 fn parse_usage(bytes: &[u8]) -> Option<Usage> {
     #[derive(Deserialize)]
-    struct Envelope {
-        usage: Option<Report>,
+    struct Envelope<'a> {
+        #[serde(borrow)]
+        usage: Option<&'a serde_json::value::RawValue>,
     }
     #[derive(Deserialize)]
     struct Report {
@@ -101,7 +102,14 @@ fn parse_usage(bytes: &[u8]) -> Option<Usage> {
     }
     // Ignore completion text and provider metadata without allocating a Value
     // tree for every streamed event.
-    let report = serde_json::from_slice::<Envelope>(bytes).ok()?.usage?;
+    if bytes.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+        return None;
+    }
+    let raw = serde_json::from_slice::<Envelope<'_>>(bytes).ok()?.usage?;
+    if !raw.get().starts_with('{') {
+        return None;
+    }
+    let report = serde_json::from_str::<Report>(raw.get()).ok()?;
     let Report {
         prompt_tokens,
         completion_tokens,
@@ -283,6 +291,8 @@ mod tests {
             b"not json".as_slice(),
             b"{}".as_slice(),
             b"{\"usage\":null}".as_slice(),
+            br#"{"usage":[3,2,5]}"#.as_slice(),
+            br#"[{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}]"#.as_slice(),
         ] {
             let mut parser = tracker("application/json");
             parser.feed(bytes);
@@ -350,6 +360,8 @@ mod tests {
             br#"{"usage":{"prompt_tokens":9223372036854775807,"completion_tokens":1,"total_tokens":0}}"#,
             br#"{"usage":{"prompt_tokens":9223372036854775808,"completion_tokens":0,"total_tokens":9223372036854775808}}"#,
             br#"{"usage":{"prompt_tokens":"3","completion_tokens":2,"total_tokens":5}}"#,
+            br#"{"usage":[3,2,5]}"#,
+            br#"[{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}]"#,
             b"broken json",
         ];
         let mut parser = tracker("text/event-stream");
@@ -358,7 +370,11 @@ mod tests {
             assert_eq!(parser.observed(), None);
         }
         event(&mut parser, REPORT);
-        event(&mut parser, b"broken json");
+        assert_eq!(parser.observed(), expected(3, 2));
+        for report in invalid {
+            event(&mut parser, report);
+            assert_eq!(parser.observed(), expected(3, 2));
+        }
         assert_eq!(parser.finish(), expected(3, 2));
     }
 

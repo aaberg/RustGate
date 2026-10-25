@@ -52,12 +52,25 @@ impl Accounting {
         self.pending.as_mut().unwrap().usage = None;
     }
 
-    pub(super) async fn finish(mut self, outcome: &'static str, usage: Option<Usage>) {
+    pub(super) async fn finish(self, outcome: &'static str, usage: Option<Usage>) {
+        let _ = self.finish_worker(outcome, usage).await;
+    }
+
+    pub(super) fn finish_in_background(self, outcome: &'static str, usage: Option<Usage>) {
+        drop(self.finish_worker(outcome, usage));
+    }
+
+    fn finish_worker(
+        mut self,
+        outcome: &'static str,
+        usage: Option<Usage>,
+    ) -> tokio::task::JoinHandle<()> {
         let mut pending = self.pending.take().unwrap();
         pending.outcome = outcome;
         pending.usage = usage;
-        // The worker owns the permit even if its waiter is cancelled.
-        let _ = tokio::task::spawn_blocking(move || pending.reconcile()).await;
+        // Configure the terminal outcome and transfer ownership synchronously,
+        // before a response can return or runtime shutdown cancels async tasks.
+        tokio::task::spawn_blocking(move || pending.reconcile())
     }
 
     pub(super) async fn reject(self) {

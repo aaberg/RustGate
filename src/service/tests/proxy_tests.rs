@@ -366,10 +366,15 @@ async fn connection_failures_are_generic_and_committed_body_failures_are_transpo
     let token = token(&fixture).await;
     upstream.task.abort();
     let _ = (&mut upstream.task).await;
-    let (status, _, body) = send(fixture.app, chat(chat_body().to_string(), Some(&token))).await;
+    let (status, _, body) = send(
+        fixture.app.clone(),
+        chat(chat_body().to_string(), Some(&token)),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_private_error(&body);
     assert_eq!(persisted(&fixture.path)["requests_used"], 1);
+    wait_for_accounting(&fixture).await;
 
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let count = calls.clone();
