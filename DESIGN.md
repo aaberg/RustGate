@@ -291,11 +291,14 @@ Send JSON to `POST /v1/chat/completions`. The fixed assistant reply is `Hello fr
 
 | Query control | Behavior |
 | --- | --- |
-| `mode=normal` (default) | Immediate JSON completion |
+| `mode` omitted | SSE when the body contains literal `"stream": true`; otherwise immediate JSON |
+| `mode=normal` | Force immediate JSON, even for a streaming request |
 | `mode=delayed` | JSON completion after `delay_ms` |
 | `mode=sse` | Immediate first SSE chunk, second chunk after `delay_ms`, then a usage chunk and `[DONE]` |
 | `mode=failure` | HTTP 503 with a structured error and `Retry-After: 1` |
 | `delay_ms` | Default 100; accepted range 0–10000 |
+
+Explicit modes override the body for deterministic fixture scenarios. Ordinary OpenAI-compatible clients need no query parameters: their `stream` field selects the response format. This also allows streaming chat and non-streaming auxiliary calls to share the mock without forcing SSE for every call. Each SSE reply includes a choice with `finish_reason: "stop"` before its usage-only chunk and `[DONE]`.
 
 ```sh
 curl http://127.0.0.1:9090/v1/chat/completions \
@@ -309,6 +312,47 @@ curl -N 'http://127.0.0.1:9090/v1/chat/completions?mode=sse&delay_ms=500' \
 `GET /__mock/requests` returns an array of captured requests with `method`, `path` (without query), `authorization` (or `null`), and parsed JSON `body`. `DELETE /__mock/requests` clears it and returns 204. Captures are in memory, isolated per fixture, and retain only the newest 100 requests. JSON request bodies are limited to 1 MiB; malformed JSON and invalid mode/delay controls are rejected without capture. Valid requests are captured before waiting or returning a controlled failure.
 
 **The capture API deliberately exposes request bodies and credentials without authentication.** Use fake credentials only; nothing captured is written to logs or disk. This fixture is not part of the production service.
+
+### Testing with OpenCode
+
+Start the mock and HTTPS service and issue a job as above. Use only the fake upstream credential with the mock. Before changing to a disposable OpenCode working directory, export the issued job token and the absolute certificate path:
+
+```sh
+export RG_JOB_TOKEN="$JOB_TOKEN"
+export NODE_EXTRA_CA_CERTS="$PWD/cert.pem"
+```
+
+In that working directory, configure `opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "enabled_providers": ["rustgate"],
+  "model": "rustgate/mock-mistral",
+  "small_model": "rustgate/mock-mistral",
+  "provider": {
+    "rustgate": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "RustGate local",
+      "options": {
+        "baseURL": "https://localhost:8443/v1",
+        "apiKey": "{env:RG_JOB_TOKEN}"
+      },
+      "models": {
+        "mock-mistral": {
+          "name": "RustGate streaming mock",
+          "limit": {"context": 32768, "output": 4096}
+        }
+      }
+    }
+  }
+}
+```
+
+Run `opencode run --model rustgate/mock-mistral "Say hello. Do not use tools."`, or launch the TUI with `opencode --model rustgate/mock-mistral`. The expected reply is `Hello from mock.`. OpenCode 1.19.4 was exercised end to end against RustGate over HTTPS: it completed with finish reason `stop`, without query options. Provider-specific query handling is not needed for this setup. The default mock pause is only 100 ms; use curl with `?delay_ms=3000` and `"stream": true` to make incremental arrival obvious. The mock is not a coding model or tool-calling emulator.
+
+If OpenCode reports `OpenAI Chat stream ended without finish_reason`, first rebuild/restart the mock and remove any forced `mode=normal` or `mode=sse` query option. Before this compatibility fix, a request with `"stream": true` but no mode query received JSON; the corrected mock selects SSE from the body. Keep the proxy's real stream errors visible rather than synthesizing a finish reason. OpenCode may retry failed generations; RustGate itself does not retry, and each admitted client retry consumes another request slot.
+
 
 ### Checks
 
