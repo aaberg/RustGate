@@ -463,3 +463,74 @@ async fn connect_deadline_includes_tls_handshake_without_retrying() {
     assert_eq!(connections.load(Ordering::SeqCst), 1);
     assert_eq!(persisted(&fixture.path)["requests_used"], 1);
 }
+
+fn blocked_admission_retains_capacity(timeout: bool) {
+    // Keep admission queued deterministically, without sleeps or production hooks.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (fixture, _server, _chunks, mut captures) = fixture(|settings| {
+            settings.max_in_flight_requests = 1;
+            settings.overall_timeout_seconds = 1;
+        })
+        .await;
+        let token = token(&fixture).await;
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = started.send(());
+            // Dropping release also unblocks this worker during panic cleanup.
+            let _ = wait.recv();
+        });
+        bounded(entered).await.unwrap();
+
+        let mut pending = Box::pin(fixture.app.clone().oneshot(chat(payload(), &token)));
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        if timeout {
+            assert_eq!(
+                bounded(pending).await.unwrap().status(),
+                StatusCode::GATEWAY_TIMEOUT
+            );
+        } else {
+            drop(pending);
+        }
+
+        let (status, headers, _) = bounded(send(fixture.app.clone(), chat("{", &token))).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(headers[header::RETRY_AFTER], "1");
+        assert_eq!(persisted(&fixture.path)["requests_used"], 0);
+        assert!(captures.try_recv().is_err());
+
+        drop(release);
+        bounded(blocker).await.unwrap();
+        bounded(async {
+            loop {
+                let (status, _, _) = send(fixture.app.clone(), chat("{", &token)).await;
+                if status == StatusCode::SERVICE_UNAVAILABLE {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                break;
+            }
+        })
+        .await;
+        // The abandoned admission still charges once, but never forwards. Only
+        // the subsequent malformed request consumes another slot after recovery.
+        assert_eq!(persisted(&fixture.path)["requests_used"], 2);
+        assert!(captures.try_recv().is_err());
+    });
+}
+
+#[test]
+fn cancelled_blocking_admission_remains_in_flight_until_worker_finishes() {
+    blocked_admission_retains_capacity(false);
+}
+
+#[test]
+fn timed_out_blocking_admission_remains_in_flight_until_worker_finishes() {
+    blocked_admission_retains_capacity(true);
+}

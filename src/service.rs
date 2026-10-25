@@ -198,13 +198,20 @@ async fn admitted_chat(
     deadline: Instant,
 ) -> Response {
     let store = state.store.clone();
-    let job = match tokio::task::spawn_blocking(move || store.admit_job(token_hash)).await {
-        Ok(Ok(JobAdmission::Admitted(job))) => job,
-        Ok(Ok(JobAdmission::Unauthorized)) => return unauthorized(),
-        Ok(Ok(JobAdmission::Exhausted)) => {
+    // Blocking work outlives a cancelled waiter. Keep its capacity charged until
+    // admission actually finishes, then transfer the permit back to the request.
+    let (job, permit) = match tokio::task::spawn_blocking(move || {
+        let admission = store.admit_job(token_hash);
+        (admission, permit)
+    })
+    .await
+    {
+        Ok((Ok(JobAdmission::Admitted(job)), permit)) => (job, permit),
+        Ok((Ok(JobAdmission::Unauthorized), _)) => return unauthorized(),
+        Ok((Ok(JobAdmission::Exhausted), _)) => {
             return error(StatusCode::TOO_MANY_REQUESTS, "Request quota exhausted");
         }
-        Ok(Err(_)) | Err(_) => {
+        Ok((Err(_), _)) | Err(_) => {
             return error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Could not authenticate job",
