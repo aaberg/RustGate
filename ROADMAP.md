@@ -18,7 +18,7 @@ Each increment delivers demonstrable behavior, not just scaffolding.
 
 | Step | Deliverable | Acceptance check |
 | --- | --- | --- |
-| **1. Runnable service and mock upstream** | Configuration loading, `/healthz`, graceful shutdown, and a local upstream fixture. | Start the service and call health; drive the fixture through ordinary and delayed responses. |
+| **1. Runnable service and mock upstream — complete** | Configuration loading, `/healthz`, graceful shutdown, and a local upstream fixture. | Start the service and call health; drive the fixture through ordinary and delayed responses. |
 | **2. Job issuance and persistence** | SQLite migrations, authenticated control plane over TLS, key-pool configuration, and `POST /v1/jobs`. Generate secure tokens; persist only hashes and the job's authoritative prompt. | Issue a job, inspect persisted state, restart the service, and verify the job survives. Reject unauthenticated issuance and unknown key IDs. |
 | **3. First complete proxy request** | Support non-streaming chat only: job-token authentication, active-state checks, exact route allowlisting, bounded request bodies, and upstream authorization replacement. Never retry automatically. | Issue a token and send a chat request. The mock sees the configured upstream credential, not the job token. Invalid tokens and forbidden routes never reach it. |
 | **4. Complete job lifecycle** | Expiry, revoke, and done transitions, including their interaction with requests already admitted. | Hold an upstream request open, revoke the job, verify that request finishes while subsequent requests fail. Exercise expiry and done across restart. |
@@ -32,6 +32,10 @@ Each increment delivers demonstrable behavior, not just scaffolding.
 | **12. Operational readiness** | Complete structured logs, Prometheus metrics, per-key usage aggregates, deployment configuration, and operator documentation. Implement spend reporting only with an explicit pricing model. | Run a staging scenario covering issuance, streaming, exhaustion, revocation, and restart; verify the resulting logs and metrics contain no secrets or request bodies. |
 
 For every increment, update the relevant specification details and keep regression tests for consumer-visible boundaries and failure cases.
+
+Step 1 is implemented as the `rustgate` service and separate `mock-upstream` executable. Both are HTTP-only and loopback-only until TLS is implemented in step 2. See [the local development contract](DESIGN.md#step-1-local-development-service) for configuration, commands, fixture controls, and capture-API safety limits.
+
+Verification: 9 regression tests pass; Clippy passes with warnings denied. Live HTTP checks cover health, configuration-file/environment precedence, ordinary and delayed completions, incremental SSE with usage, controlled failures, request capture/eviction/clearing, invalid input and body limits, startup rejection, and graceful shutdown while a delayed request is active. No authenticated proxy behavior is implemented yet.
 
 ## Release checkpoints
 
