@@ -33,6 +33,13 @@ pub(crate) struct AdmittedJob {
     pub system_prompt: String,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum JobAdmission {
+    Unauthorized,
+    Exhausted,
+    Admitted(AdmittedJob),
+}
+
 pub(crate) enum InsertError {
     DuplicateJob,
     Storage,
@@ -171,9 +178,9 @@ impl Store {
         }
     }
 
-    /// Commits admission on a blocking worker, materializing expiry before lookup.
-    /// Admitted requests do not recheck state while their upstream call is running.
-    pub(crate) fn admit_job(&self, token_hash: [u8; 32]) -> Result<Option<AdmittedJob>> {
+    /// Permanently charges admission on a blocking worker after materializing expiry.
+    /// The final permitted request keeps its snapshot even though it exhausts the job.
+    pub(crate) fn admit_job(&self, token_hash: [u8; 32]) -> Result<JobAdmission> {
         let mut connection = self
             .connection
             .lock()
@@ -255,7 +262,7 @@ fn admit_job_in_transaction(
     transaction: &rusqlite::Transaction<'_>,
     token_hash: [u8; 32],
     now: i64,
-) -> Result<Option<AdmittedJob>> {
+) -> Result<JobAdmission> {
     transaction
         .execute(
             "UPDATE jobs SET status = 'expired'
@@ -263,11 +270,15 @@ fn admit_job_in_transaction(
             params![token_hash.as_slice(), now],
         )
         .context("could not expire job during admission")?;
-    transaction
+    let admitted = transaction
         .query_row(
-            "SELECT upstream_key_id, system_prompt FROM jobs
-             WHERE token_hash = ?1 AND status = 'active' AND expires_at > ?2",
-            params![token_hash.as_slice(), now],
+            "UPDATE jobs
+             SET requests_used = requests_used + 1,
+                 status = CASE WHEN requests_used = max_requests - 1
+                               THEN 'exhausted' ELSE 'active' END
+             WHERE token_hash = ?1 AND status = 'active' AND requests_used < max_requests
+             RETURNING upstream_key_id, system_prompt",
+            params![token_hash.as_slice()],
             |row| {
                 Ok(AdmittedJob {
                     upstream_key_id: row.get(0)?,
@@ -276,7 +287,23 @@ fn admit_job_in_transaction(
             },
         )
         .optional()
-        .context("could not look up job")
+        .context("could not charge job admission")?;
+    if let Some(job) = admitted {
+        return Ok(JobAdmission::Admitted(job));
+    }
+    let exhausted = transaction
+        .query_row(
+            "SELECT status = 'exhausted' FROM jobs WHERE token_hash = ?1",
+            params![token_hash.as_slice()],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()
+        .context("could not look up job admission status")?;
+    Ok(if exhausted == Some(true) {
+        JobAdmission::Exhausted
+    } else {
+        JobAdmission::Unauthorized
+    })
 }
 
 #[cfg(test)]
@@ -311,6 +338,16 @@ mod tests {
             .unwrap()
     }
 
+    fn quota_state(connection: &Connection, job_id: &str) -> (String, i64) {
+        connection
+            .query_row(
+                "SELECT status, requests_used FROM jobs WHERE job_id = ?1",
+                params![job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
     #[test]
     fn admission_expires_at_the_exact_boundary() {
         let directory = tempfile::tempdir().unwrap();
@@ -326,15 +363,15 @@ mod tests {
             .unwrap();
         assert_eq!(
             admit_job_in_transaction(&transaction, [1; 32], 1_000).unwrap(),
-            None
+            JobAdmission::Unauthorized
         );
         assert_eq!(
             admit_job_in_transaction(&transaction, [2; 32], 1_000).unwrap(),
-            None
+            JobAdmission::Unauthorized
         );
         assert_eq!(
             admit_job_in_transaction(&transaction, [3; 32], 1_000).unwrap(),
-            Some(AdmittedJob {
+            JobAdmission::Admitted(AdmittedJob {
                 upstream_key_id: "upstream".to_owned(),
                 system_prompt: "system".to_owned(),
             })
@@ -357,11 +394,17 @@ mod tests {
         insert_job(&store, "unrelated", 2, 2);
         insert_job(&store, "future", 3, i64::MAX);
 
-        assert_eq!(store.admit_job([1; 32]).unwrap(), None);
-        assert_eq!(store.admit_job([9; 32]).unwrap(), None);
+        assert_eq!(
+            store.admit_job([1; 32]).unwrap(),
+            JobAdmission::Unauthorized
+        );
+        assert_eq!(
+            store.admit_job([9; 32]).unwrap(),
+            JobAdmission::Unauthorized
+        );
         assert_eq!(
             store.admit_job([3; 32]).unwrap(),
-            Some(AdmittedJob {
+            JobAdmission::Admitted(AdmittedJob {
                 upstream_key_id: "upstream".to_owned(),
                 system_prompt: "system".to_owned(),
             })
@@ -376,7 +419,10 @@ mod tests {
         assert_eq!(job_state(&observer, "future").0, "active");
         drop(store);
         let reopened = Store::open(&path).unwrap();
-        assert_eq!(reopened.admit_job([1; 32]).unwrap(), None);
+        assert_eq!(
+            reopened.admit_job([1; 32]).unwrap(),
+            JobAdmission::Unauthorized
+        );
         assert_eq!(job_state(&observer, "overdue").0, "expired");
     }
 
@@ -467,7 +513,10 @@ mod tests {
                 store.transition_job(job_id, other_transition),
                 Err(TransitionError::Conflict)
             );
-            assert_eq!(store.admit_job([token; 32]).unwrap(), None);
+            assert_eq!(
+                store.admit_job([token; 32]).unwrap(),
+                JobAdmission::Unauthorized
+            );
             assert_eq!(job_state(&observer, job_id), snapshot);
             snapshots.push((job_id, snapshot));
         }
@@ -623,8 +672,239 @@ mod tests {
                 JobTransition::Done => "done",
             };
             assert_eq!(job_state(&observer, job_id).0, status);
-            assert_eq!(first.admit_job([token; 32]).unwrap(), None);
+            assert_eq!(
+                first.admit_job([token; 32]).unwrap(),
+                JobAdmission::Unauthorized
+            );
             assert_eq!(second.transition_job(job_id, winner), Ok(()));
+        }
+    }
+
+    #[test]
+    fn independent_connections_charge_only_the_remaining_allowance() {
+        use std::sync::Barrier;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open(&path).unwrap();
+        insert_job(&store, "job", 1, i64::MAX);
+        let observer = Connection::open(&path).unwrap();
+        observer
+            .execute("UPDATE jobs SET requests_used = 7 WHERE job_id = 'job'", [])
+            .unwrap();
+        let contenders: Vec<_> = (0..12).map(|_| Store::open(&path).unwrap()).collect();
+        let barrier = Barrier::new(contenders.len());
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = contenders
+                .iter()
+                .map(|contender| {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        contender.admit_job([1; 32]).unwrap()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, JobAdmission::Admitted(_)))
+                .count(),
+            3
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == JobAdmission::Exhausted)
+                .count(),
+            9
+        );
+        assert_eq!(quota_state(&observer, "job"), ("exhausted".to_owned(), 10));
+        drop(contenders);
+        drop(store);
+
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(
+            reopened.admit_job([1; 32]).unwrap(),
+            JobAdmission::Exhausted
+        );
+        assert_eq!(quota_state(&observer, "job"), ("exhausted".to_owned(), 10));
+    }
+
+    #[test]
+    fn final_slot_returns_the_snapshot_and_exhaustion_wins_over_expiry_and_lifecycle() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open(&path).unwrap();
+        insert_job(&store, "job", 1, i64::MAX);
+        let observer = Connection::open(&path).unwrap();
+        observer
+            .execute(
+                "UPDATE jobs SET max_requests = 1, upstream_key_id = 'chosen-key',
+                 system_prompt = 'chosen system prompt' WHERE job_id = 'job'",
+                [],
+            )
+            .unwrap();
+        let admitted = store.admit_job([1; 32]).unwrap();
+        assert_eq!(quota_state(&observer, "job"), ("exhausted".to_owned(), 1));
+        observer
+            .execute("UPDATE jobs SET expires_at = 2 WHERE job_id = 'job'", [])
+            .unwrap();
+        for transition in [JobTransition::Revoke, JobTransition::Done] {
+            assert_eq!(
+                store.transition_job("job", transition),
+                Err(TransitionError::Conflict)
+            );
+        }
+        assert_eq!(
+            admitted,
+            JobAdmission::Admitted(AdmittedJob {
+                upstream_key_id: "chosen-key".to_owned(),
+                system_prompt: "chosen system prompt".to_owned(),
+            })
+        );
+        drop(store);
+
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(
+            reopened.admit_job([1; 32]).unwrap(),
+            JobAdmission::Exhausted
+        );
+        assert_eq!(quota_state(&observer, "job"), ("exhausted".to_owned(), 1));
+    }
+
+    #[test]
+    fn failed_admission_rolls_back_the_charge_and_terminal_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open(&path).unwrap();
+        insert_job(&store, "job", 1, i64::MAX);
+        let observer = Connection::open(&path).unwrap();
+        observer
+            .execute_batch(
+                "UPDATE jobs SET max_requests = 1 WHERE job_id = 'job';
+                 CREATE TRIGGER reject_charge AFTER UPDATE OF requests_used ON jobs
+                 BEGIN SELECT RAISE(FAIL, 'charge rejected'); END;",
+            )
+            .unwrap();
+        assert!(store.admit_job([1; 32]).is_err());
+        assert_eq!(quota_state(&observer, "job"), ("active".to_owned(), 0));
+        drop(store);
+
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(quota_state(&observer, "job"), ("active".to_owned(), 0));
+        observer
+            .execute_batch("DROP TRIGGER reject_charge;")
+            .unwrap();
+        assert!(matches!(
+            reopened.admit_job([1; 32]).unwrap(),
+            JobAdmission::Admitted(_)
+        ));
+        assert_eq!(quota_state(&observer, "job"), ("exhausted".to_owned(), 1));
+    }
+
+    #[test]
+    fn signed_integer_maximum_is_a_safe_final_charge() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open(&path).unwrap();
+        insert_job(&store, "job", 1, i64::MAX);
+        let observer = Connection::open(&path).unwrap();
+        observer
+            .execute(
+                "UPDATE jobs SET max_requests = ?1, requests_used = ?2 WHERE job_id = 'job'",
+                params![i64::MAX, i64::MAX - 1],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.admit_job([1; 32]).unwrap(),
+            JobAdmission::Admitted(_)
+        ));
+        assert_eq!(store.admit_job([1; 32]).unwrap(), JobAdmission::Exhausted);
+        assert_eq!(
+            quota_state(&observer, "job"),
+            ("exhausted".to_owned(), i64::MAX)
+        );
+    }
+
+    #[test]
+    fn terminal_and_unknown_credentials_never_charge() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open(&path).unwrap();
+        let observer = Connection::open(&path).unwrap();
+        for (token, status) in [(1, "revoked"), (2, "done"), (3, "expired")] {
+            insert_job(&store, status, token, i64::MAX);
+            observer
+                .execute(
+                    "UPDATE jobs SET status = ?1 WHERE job_id = ?1",
+                    params![status],
+                )
+                .unwrap();
+            assert_eq!(
+                store.admit_job([token; 32]).unwrap(),
+                JobAdmission::Unauthorized
+            );
+            assert_eq!(quota_state(&observer, status), (status.to_owned(), 0));
+        }
+        insert_job(&store, "overdue", 4, 2);
+        assert_eq!(
+            store.admit_job([4; 32]).unwrap(),
+            JobAdmission::Unauthorized
+        );
+        assert_eq!(quota_state(&observer, "overdue"), ("expired".to_owned(), 0));
+        assert_eq!(
+            store.admit_job([9; 32]).unwrap(),
+            JobAdmission::Unauthorized
+        );
+    }
+
+    #[test]
+    fn final_admission_and_lifecycle_have_exactly_one_terminal_winner() {
+        use std::sync::Barrier;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let first = Store::open(&path).unwrap();
+        let second = Store::open(&path).unwrap();
+        let observer = Connection::open(&path).unwrap();
+        for (token, transition, status) in [
+            (1, JobTransition::Revoke, "revoked"),
+            (2, JobTransition::Done, "done"),
+        ] {
+            insert_job(&first, status, token, i64::MAX);
+            observer
+                .execute(
+                    "UPDATE jobs SET max_requests = 1 WHERE job_id = ?1",
+                    params![status],
+                )
+                .unwrap();
+            let barrier = Barrier::new(2);
+            let (admission, lifecycle) = std::thread::scope(|scope| {
+                let admission = scope.spawn(|| {
+                    barrier.wait();
+                    first.admit_job([token; 32]).unwrap()
+                });
+                let lifecycle = scope.spawn(|| {
+                    barrier.wait();
+                    second.transition_job(status, transition)
+                });
+                (admission.join().unwrap(), lifecycle.join().unwrap())
+            });
+            match (admission, lifecycle) {
+                (JobAdmission::Admitted(_), Err(TransitionError::Conflict)) => {
+                    assert_eq!(quota_state(&observer, status), ("exhausted".to_owned(), 1));
+                }
+                (JobAdmission::Unauthorized, Ok(())) => {
+                    assert_eq!(quota_state(&observer, status), (status.to_owned(), 0));
+                }
+                results => panic!("expected exactly one terminal winner, got {results:?}"),
+            }
         }
     }
 
