@@ -6,7 +6,10 @@ use std::{
 use anyhow::Context;
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, FromRequest, Path, Request, State, rejection::JsonRejection},
+    extract::{
+        DefaultBodyLimit, FromRequest, Path, Request, State,
+        rejection::{JsonRejection, PathRejection},
+    },
     http::{HeaderMap, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -242,23 +245,26 @@ async fn proxy_chat(State(state): State<Arc<ServiceState>>, request: Request) ->
 
 async fn revoke_job(
     State(state): State<Arc<ServiceState>>,
-    Path(job_id): Path<String>,
+    job_id: Result<Path<String>, PathRejection>,
 ) -> Response {
     transition_job(state, job_id, JobTransition::Revoke).await
 }
 
 async fn finish_job(
     State(state): State<Arc<ServiceState>>,
-    Path(job_id): Path<String>,
+    job_id: Result<Path<String>, PathRejection>,
 ) -> Response {
     transition_job(state, job_id, JobTransition::Done).await
 }
 
 async fn transition_job(
     state: Arc<ServiceState>,
-    job_id: String,
+    job_id: Result<Path<String>, PathRejection>,
     transition: JobTransition,
 ) -> Response {
+    let Ok(Path(job_id)) = job_id else {
+        return error(StatusCode::BAD_REQUEST, "Invalid job request");
+    };
     let Ok(job_id) = Uuid::parse_str(&job_id) else {
         return error(StatusCode::BAD_REQUEST, "Invalid job request");
     };

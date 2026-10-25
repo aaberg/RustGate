@@ -99,17 +99,14 @@ async fn lifecycle_authentication_precedes_path_extraction_and_never_reads_a_bod
             format!("Bearer {CONTROL_TOKEN}").parse().unwrap(),
         );
         assert_error(fixture.app.clone(), duplicate, StatusCode::UNAUTHORIZED).await;
-        assert_error(
-            fixture.app.clone(),
-            lifecycle(
-                "secret-invalid-uuid",
-                action,
-                Some(CONTROL_TOKEN),
-                unread_body(),
-            ),
-            StatusCode::BAD_REQUEST,
-        )
-        .await;
+        for job_id in ["secret-invalid-uuid", "%FF"] {
+            assert_error(
+                fixture.app.clone(),
+                lifecycle(job_id, action, Some(CONTROL_TOKEN), unread_body()),
+                StatusCode::BAD_REQUEST,
+            )
+            .await;
+        }
         assert_error(
             fixture.app.clone(),
             lifecycle(OTHER_JOB_ID, action, Some(CONTROL_TOKEN), Body::empty()),
