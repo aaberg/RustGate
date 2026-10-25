@@ -78,9 +78,9 @@ Order of checks on every proxied request:
 
 ## Streaming and timeouts
 
-* Pass-through streaming both ways; flush chunks immediately.
-* Upstream connect timeout ~5 s, first-byte timeout ~60 s, overall request timeout ~10 min (long agent calls), idle stream timeout ~120 s.
-* Total requests in flight: bounded (e.g. 2× max concurrent builds) — return 503 with retry hint when saturated.
+* Forward upstream response bytes incrementally, including SSE; never buffer a whole response or synthesize completion events. Chat request JSON remains bounded and buffered for authoritative prompt injection.
+* Configurable upstream connect timeout defaults to 5 s, first-byte timeout to 60 s, overall request timeout to 10 min, and idle stream timeout to 120 s.
+* Bound requests in flight per service process (default 64); return 503 with `Retry-After: 1` when saturated, without queueing or charging request allowance.
 
 ## Observability
 
@@ -107,9 +107,9 @@ Order of checks on every proxied request:
  * Streaming: SSE response streams incrementally end-to-end.
  * Path allowlist rejects /v1/admin style paths.
 
-## Implemented service: steps 1 through 6
+## Implemented service: steps 1 through 7
 
-The service implements HTTPS, configuration, health, graceful shutdown, authenticated job issuance, SQLite persistence, job-authenticated non-streaming chat proxying, durable expiry/revoke/done transitions, authoritative prompt injection, and concurrent request quotas. The separate mock remains a loopback-only HTTP fixture. Token accounting/enforcement, streaming, and full resource bounds are **not implemented yet**; persisted token caps remain issuance metadata. Do not connect real build containers yet.
+The service implements HTTPS, configuration, health, graceful shutdown, authenticated job issuance, SQLite persistence, job-authenticated chat proxying with incremental SSE responses, durable expiry/revoke/done transitions, authoritative prompt injection, concurrent request quotas, and bounded concurrency/timeouts. The separate mock remains a loopback-only HTTP fixture. Token accounting/enforcement is **not implemented yet**; persisted token caps remain issuance metadata. Do not connect real build containers yet.
 
 ### Running
 
@@ -154,8 +154,15 @@ Precedence: built-in defaults, optional TOML file selected by `RUSTGATE_CONFIG`,
 | `default_ttl_seconds`, `max_ttl_seconds` | `1800`, `86400`; maximum cannot exceed 31536000 seconds |
 | `default_max_requests`, `max_requests` | `100`, `10000` |
 | `default_max_tokens_total`, `max_tokens_total` | `2000000`, `100000000` |
+| `connect_timeout_seconds` | `5`; TCP connect and TLS handshake deadline |
+| `first_byte_timeout_seconds` | `60`; upstream dispatch through first nonempty body chunk or clean EOF |
+| `idle_timeout_seconds` | `120`; wait for the next nonempty upstream body chunk or EOF |
+| `overall_timeout_seconds` | `600`; admission, incoming body read, dispatch, and response relay |
+| `max_in_flight_requests` | `64`; per process, accepted range 1–65536 |
 
 Defaults must be positive and not exceed their maxima; all maxima must fit a signed SQLite integer. Upstream URLs cannot include credentials, query strings, or fragments. Key credentials must be nonempty visible ASCII without whitespace. Mount secret configuration read-only with restrictive permissions, or supply environment variables; neither key-pool credentials nor the control credential are persisted in SQLite. Keys are loaded at startup; restart to change the pool.
+
+Each timeout must be an integer between 1 and 86400 seconds. The deadlines are independent: the earliest applicable deadline wins. Size concurrency for the deployment's expected parallel builds; processes sharing SQLite still have independent resource limits.
 
 ### Issuing and inspecting a job
 
@@ -229,11 +236,11 @@ curl http://127.0.0.1:9090/__mock/requests
 # authorization is "Bearer fake-upstream-credential", never the job token
 ```
 
-Admission hashes the bearer and looks up the persisted job on every request, requiring `status = active`, `expires_at` strictly later than the current epoch second, and remaining request allowance. Missing, malformed, duplicate, unknown, expired, revoked, or done job credentials receive generic `401` with `WWW-Authenticate: Bearer`; exhausted jobs receive `429` as specified below. Control credentials are not job credentials. A job whose key ID has been removed from the startup key pool also receives `401` after its admission is charged; storage failures receive generic `500`. Expiry and revoke/done ordering follow the lifecycle contract above.
+When capacity is available, admission hashes the bearer and looks up the persisted job on every request, requiring `status = active`, `expires_at` strictly later than the current epoch second, and remaining request allowance. Missing, malformed, or duplicate credentials receive generic `401` before capacity checks; unknown, expired, revoked, or done job credentials receive generic `401` after capacity checks, with `WWW-Authenticate: Bearer`. Exhausted jobs receive `429` as specified below. Control credentials are not job credentials. A job whose key ID has been removed from the startup key pool also receives `401` after its admission is charged; storage failures receive generic `500`. Expiry and revoke/done ordering follow the lifecycle contract above.
 
 After charged admission, the fixed allowlist permits only exact `POST /v1/chat/completions`. Other methods and paths receive `403`, including trailing slashes, encoded alternatives, embeddings, models, and admin paths. The separate health, issuance, and lifecycle routes retain their own contracts and do not consume job request allowance. Authentication, quota admission, and route checks precede body reads.
 
-The body must be a JSON object with a JSON content type and at most 1 MiB, including unknown-length/chunked bodies. `messages` must be an array (an empty array is permitted); missing or non-array values receive `400`. `stream` must be omitted or literal `false`; streaming, invalid JSON, non-object bodies, and invalid content types receive `400`, while oversized bodies receive `413`. Message-entry schemas and other provider-specific chat fields are left to upstream validation. JSON is parsed and reserialized before forwarding so duplicate keys cannot give the proxy and upstream different interpretations.
+The body must be a JSON object with a JSON content type and at most 1 MiB, including unknown-length/chunked bodies. `messages` must be an array (an empty array is permitted); missing or non-array values receive `400`. `stream` may be omitted or a literal boolean, including `true` for SSE; other stream types, invalid JSON, non-object bodies, and invalid content types receive `400`, while oversized bodies receive `413`. Message-entry schemas and other provider-specific chat fields are left to upstream validation. JSON is parsed and reserialized before forwarding so duplicate keys cannot give the proxy and upstream different interpretations.
 
 For supported chat requests, prompt injection removes all messages whose `role` is exactly `"system"` and whose string `content` equals the stored prompt, then prepends a new `{"role":"system","content":<stored prompt>}` message. This yields exactly one authoritative system-content match, at index zero, even if the client supplied several copies or placed them later in the conversation. Duplicate messages' client metadata is discarded; it is not attached to the authoritative message.
 
@@ -243,9 +250,29 @@ The 1 MiB cap applies to the incoming body before injection; the transformed ups
 
 The configured upstream base path is a prefix: `https://host/gateway/` targets `/gateway/v1/chat/completions`. The admitted request's query is preserved, but its host and path cannot select another destination. A fresh upstream request contains the selected key as bearer authorization and JSON content type, without forwarding client authorization, cookies, proxy credentials, or arbitrary client headers. Redirects and automatic retries are disabled, as are environment-selected HTTP proxies.
 
-Responses are buffered in this increment. Upstream status and body pass through, along with `Content-Type`, `Content-Encoding`, and `Retry-After` when present; other upstream headers, including redirects' `Location` and cookies, are not forwarded. Compressed bodies are not decompressed by the proxy: all `Content-Encoding` values are preserved in order so clients can decode the unchanged bytes. Proxy responses use `Cache-Control: no-store`. Connection and response-read failures receive generic `502` without underlying diagnostics or credentials. Upstream failures are never retried; the client decides whether to retry. Usage in a completion is returned but tokens are not yet accounted or capped.
+Responses are forwarded incrementally, whether SSE, ordinary JSON, or an upstream error. Upstream status and body pass through, along with `Content-Type`, `Content-Encoding`, and `Retry-After` when present; other upstream headers, including redirects' `Location` and cookies, are not forwarded. Compressed bodies are not decompressed by the proxy: all `Content-Encoding` values are preserved in order so clients can decode the unchanged bytes. Proxy responses use `Cache-Control: no-store`. Upstream failures are never retried; the client decides whether to retry. Usage in a completion is returned but tokens are not yet accounted or capped.
 
-The response buffer, upstream timeouts, disconnect handling, and in-flight concurrency are not yet bounded by the step 7 policy. SSE is not forwarded incrementally.
+### Streaming and resource bounds
+
+```sh
+curl --no-buffer --cacert cert.pem \
+  'https://localhost:8443/v1/chat/completions?mode=sse&delay_ms=1000' \
+  -H "Authorization: Bearer $JOB_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"mock-mistral","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+# First "Hello " event arrives immediately; remaining events arrive later.
+# Query controls apply only to the local mock.
+```
+
+A syntactically valid bearer first acquires an in-flight permit without waiting, before SQLite admission or body reads. Saturation returns generic JSON `503` with `Retry-After: 1` and `Cache-Control: no-store`, consuming no job request allowance and making no upstream attempt. Consequently saturation takes precedence over unknown-token, inactive-job, exhausted-job, route, and body checks for well-formed bearers. Health and control-plane routes do not use this limit.
+
+The permit spans admission, bounded incoming body parsing, upstream dispatch, and response relay, and is released when the underlying work finishes. Rejections, failures, clean EOF, timeouts, and client disconnects release capacity after cleanup. Revoke/done/expiry do not cancel admitted work; disconnects and deadlines cancel further body processing and forwarding. Blocking SQLite admission cannot be cancelled: its worker owns the permit while queued or running, even after its waiting request disconnects or times out. Only worker completion releases that capacity, preventing cancelled admissions from accumulating beyond the in-flight limit. An abandoned admission may still commit a permanent request charge, but no upstream request then starts. Successful admission transfers the permit back to the request for the remaining body/response lifetime.
+
+Connect timeout includes TCP connection establishment and the TLS handshake. First-byte timing starts at upstream dispatch and covers both response headers and the first nonempty body chunk, or clean EOF for an empty response; headers alone do not satisfy it. Idle timing bounds each subsequent wait for nonempty upstream bytes or EOF. Overall timing starts before SQLite admission and incoming body reads and never resets as chunks arrive. It also bounds a relay blocked by a slow downstream consumer.
+
+Before committing a response, transport/read failures return sanitized JSON `502`; connect/first-byte/overall timeouts return sanitized JSON `504`. Once the first chunk is available, upstream status and headers are committed. A later read error, idle timeout, or overall timeout aborts the response body at the transport layer: clients must treat it as incomplete, even if they already received `200`. No diagnostic SSE event, synthetic `[DONE]`, replacement JSON, or retry hides an incomplete response.
+
+The relay keeps only one queued chunk plus its current chunk, rather than a complete response, and applies downstream backpressure. Its deadline/cancellation task runs independently of body polling, so a client that stops reading cannot hold an upstream connection or permit indefinitely. Dropping/disconnecting the downstream closes the upstream response promptly, both before the first byte and after response commitment. HTTP chunk boundaries need not match SSE event boundaries; bytes are preserved unchanged.
 
 ### Concurrent request quotas
 

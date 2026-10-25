@@ -201,7 +201,7 @@ async fn allowlist_matches_exact_method_and_raw_path_before_parsing() {
 }
 
 #[tokio::test]
-async fn non_streaming_json_and_exact_body_limit_are_enforced() {
+async fn json_shape_and_exact_body_limit_are_enforced() {
     // Injection can grow a valid 1 MiB client body beyond the local mock's
     // independent 1 MiB limit. Use an upstream with room for the stored prompt.
     let upstream = Router::new().route(
@@ -216,8 +216,11 @@ async fn non_streaming_json_and_exact_body_limit_are_enforced() {
         "null",
         "42",
         r#"{"stream":true}"#,
-        r#"{"stream":null}"#,
-        r#"{"stream":"false"}"#,
+        r#"{"messages":[],"stream":null}"#,
+        r#"{"messages":[],"stream":"false"}"#,
+        r#"{"messages":[],"stream":1}"#,
+        r#"{"messages":[],"stream":[]}"#,
+        r#"{"messages":[],"stream":{}}"#,
     ] {
         assert_eq!(
             send(fixture.app.clone(), chat(body, Some(&token))).await.0,
@@ -264,7 +267,7 @@ async fn non_streaming_json_and_exact_body_limit_are_enforced() {
         json!({"role": "system", "content": valid_body()["system_prompt"]}),
     );
     assert_eq!(forwarded, body);
-    assert_eq!(persisted(&fixture.path)["requests_used"], 11);
+    assert_eq!(persisted(&fixture.path)["requests_used"], 14);
 }
 
 #[tokio::test]
@@ -356,7 +359,7 @@ async fn upstream_failures_pass_through_once_and_redirects_are_not_followed() {
 }
 
 #[tokio::test]
-async fn connection_and_incomplete_response_failures_are_generic_bad_gateway() {
+async fn connection_failures_are_generic_and_committed_body_failures_are_transport_errors() {
     let (fixture, mut upstream) = fixture(crate::mock::router(), "").await;
     let token = token(&fixture).await;
     upstream.task.abort();
@@ -368,25 +371,60 @@ async fn connection_and_incomplete_response_failures_are_generic_bad_gateway() {
 
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let count = calls.clone();
+    let fail = Arc::new(tokio::sync::Notify::new());
+    let failure_gate = fail.clone();
     let broken = Router::new().route(
         "/v1/chat/completions",
         post(move || {
             let count = count.clone();
+            let failure_gate = failure_gate.clone();
             async move {
                 count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let chunks = futures_util::stream::iter([
-                    Ok(axum::body::Bytes::from_static(b"partial")),
-                    Err(std::io::Error::other("sensitive upstream failure")),
-                ]);
+                let chunks = futures_util::stream::unfold(0, move |index| {
+                    let failure_gate = failure_gate.clone();
+                    async move {
+                        match index {
+                            0 => Some((Ok(axum::body::Bytes::from_static(b"partial")), 1)),
+                            1 => {
+                                failure_gate.notified().await;
+                                Some((Err(std::io::Error::other("sensitive upstream failure")), 2))
+                            }
+                            _ => None,
+                        }
+                    }
+                });
                 Body::from_stream(chunks)
             }
         }),
     );
     let (fixture, _upstream) = self::fixture(broken, "").await;
     let token = self::token(&fixture).await;
-    let (status, _, body) = send(fixture.app, chat(chat_body().to_string(), Some(&token))).await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
-    assert_eq!(body, json!({"error":{"message":"Upstream request failed"}}));
+    use futures_util::StreamExt;
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fixture
+            .app
+            .oneshot(chat(chat_body().to_string(), Some(&token))),
+    )
+    .await
+    .expect("proxy buffered an unfinished upstream response")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    assert_eq!(body.next().await.unwrap().unwrap(), "partial");
+    fail.notify_one();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), body.next())
+        .await
+        .expect("broken upstream did not terminate downstream")
+        .expect("broken upstream became a clean EOF")
+        .expect_err("broken upstream injected a successful body chunk");
+    let message = error.to_string();
+    for secret in ["sensitive upstream failure", UPSTREAM_SECRET, &token] {
+        assert!(
+            !message.contains(secret),
+            "leaked transport error: {message}"
+        );
+    }
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(persisted(&fixture.path)["requests_used"], 1);
 }
