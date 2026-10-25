@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 const SCHEMA_VERSION: i64 = 1;
 
@@ -143,6 +143,24 @@ impl Store {
             }
             Err(_) => Err(InsertError::Storage),
         }
+    }
+
+    /// Read admission state on a blocking worker. Lifecycle transitions are
+    /// implemented separately; this lookup never mutates job state or usage.
+    pub(crate) fn active_job_key(&self, token_hash: [u8; 32], now: i64) -> Result<Option<String>> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock failed"))?;
+        connection
+            .query_row(
+                "SELECT upstream_key_id FROM jobs
+                 WHERE token_hash = ?1 AND status = 'active' AND expires_at > ?2",
+                params![token_hash.as_slice(), now],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("could not look up job")
     }
 }
 

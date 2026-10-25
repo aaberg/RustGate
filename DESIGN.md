@@ -107,9 +107,9 @@ Order of checks on every proxied request:
  * Streaming: SSE response streams incrementally end-to-end.
  * Path allowlist rejects /v1/admin style paths.
 
-## Implemented service: steps 1 and 2
+## Implemented service: steps 1 through 3
 
-The service implements HTTPS, configuration, health, graceful shutdown, authenticated job issuance, and SQLite persistence. The separate mock remains a loopback-only HTTP fixture. Proxy forwarding, job-token authentication, lifecycle transitions, prompt injection, and quota enforcement are **not implemented yet**; persisted caps are issuance metadata until their roadmap increments.
+The service implements HTTPS, configuration, health, graceful shutdown, authenticated job issuance, SQLite persistence, and job-authenticated non-streaming chat proxying. The separate mock remains a loopback-only HTTP fixture. Lifecycle transitions, prompt injection, quota enforcement, streaming, and full resource bounds are **not implemented yet**; persisted caps are issuance metadata until their roadmap increments. Do not connect real build containers yet.
 
 ### Running
 
@@ -190,7 +190,36 @@ sqlite3 rustgate.sqlite3 \
 # Stop and restart rustgate with the same config/database, then repeat.
 ```
 
-An existing UUID remains reserved across restart. Reissuing it must return `409`, demonstrating that issuance state survived. Tokens are not usable for proxy calls until step 3.
+An existing UUID remains reserved across restart. Reissuing it must return `409`, demonstrating that issuance state survived. Its original token remains usable for proxy calls while the job is active and unexpired.
+
+### Proxying a chat request
+
+Use the returned job token, not the control-plane credential:
+
+```sh
+export JOB_TOKEN='<token returned at issuance>'
+curl --cacert cert.pem https://localhost:8443/v1/chat/completions \
+  -H "Authorization: Bearer $JOB_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"mock-mistral","messages":[{"role":"user","content":"Hello"}],"stream":false}'
+# 200: mock completion with "Hello from mock." and usage
+
+# Local fixture only; inspect with fake credentials:
+curl http://127.0.0.1:9090/__mock/requests
+# authorization is "Bearer fake-upstream-credential", never the job token
+```
+
+Admission hashes the bearer and looks up the persisted job on every request, requiring `status = active` and `expires_at` strictly later than the current epoch second. Missing, malformed, duplicate, unknown, expired, or inactive job credentials receive generic `401` with `WWW-Authenticate: Bearer`. Control credentials are not job credentials. A job whose key ID has been removed from the startup key pool also receives `401`; storage failures receive generic `500`. Expiry is checked without changing persisted status; revoke/done APIs and lifecycle transitions remain step 4.
+
+After authentication, the fixed allowlist permits only exact `POST /v1/chat/completions`. Other methods and paths receive `403`, including trailing slashes, encoded alternatives, embeddings, models, and admin paths. The separate health and issuance routes retain their own contracts. Authentication and route checks precede body reads.
+
+The body must be a JSON object with a JSON content type and at most 1 MiB, including unknown-length/chunked bodies. `stream` must be omitted or literal `false`; streaming, invalid JSON, non-object bodies, and invalid content types receive `400`, while oversized bodies receive `413`. Provider-specific chat fields are left to upstream validation. JSON is parsed and reserialized before forwarding so duplicate keys cannot give the proxy and upstream different interpretations. No authoritative prompt is injected until step 5.
+
+The configured upstream base path is a prefix: `https://host/gateway/` targets `/gateway/v1/chat/completions`. The admitted request's query is preserved, but its host and path cannot select another destination. A fresh upstream request contains the selected key as bearer authorization and JSON content type, without forwarding client authorization, cookies, proxy credentials, or arbitrary client headers. Redirects and automatic retries are disabled, as are environment-selected HTTP proxies.
+
+Responses are buffered in this increment. Upstream status and body pass through, along with `Content-Type`, `Content-Encoding`, and `Retry-After` when present; other upstream headers, including redirects' `Location` and cookies, are not forwarded. Compressed bodies are not decompressed by the proxy: all `Content-Encoding` values are preserved in order so clients can decode the unchanged bytes. Proxy responses use `Cache-Control: no-store`. Connection and response-read failures receive generic `502` without underlying diagnostics or credentials. Upstream failures are never retried; the client decides whether to retry. Usage in a completion is returned but not accounted, and requests do not yet consume or enforce persisted quotas.
+
+The response buffer, upstream timeouts, disconnect handling, and in-flight concurrency are not yet bounded by the step 7 policy. SSE is not forwarded incrementally.
 
 ### Local mock upstream
 

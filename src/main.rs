@@ -20,7 +20,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("could not bind service listener")?;
     eprintln!("rustgate listening on https://{}", listener.local_addr()?);
-    runtime::serve_tls(listener, service::router(config, store), tls)
+    runtime::serve_tls(listener, service::router(config, store)?, tls)
         .await
         .context("service failed")
 }

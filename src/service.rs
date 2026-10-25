@@ -3,17 +3,18 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use anyhow::Context;
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Request, State, rejection::JsonRejection},
-    http::{HeaderMap, StatusCode, header},
+    extract::{DefaultBodyLimit, FromRequest, Request, State, rejection::JsonRejection},
+    http::{HeaderMap, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use rand::TryRngCore;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -30,6 +31,7 @@ struct ServiceState {
     config: Config,
     store: Store,
     control_token_hash: [u8; 32],
+    upstream: reqwest::Client,
 }
 
 #[derive(Serialize)]
@@ -57,21 +59,32 @@ struct IssuedJob<'a> {
     proxy_url: &'a str,
 }
 
-pub fn router(config: Config, store: Store) -> Router {
+pub fn router(config: Config, store: Store) -> anyhow::Result<Router> {
+    let upstream = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        // Egress is selected only by configuration, never environment proxies.
+        .no_proxy()
+        .build()
+        .context("could not initialize upstream HTTP client")?;
     let state = Arc::new(ServiceState {
         control_token_hash: Sha256::digest(config.control_plane_token.as_bytes()).into(),
         config,
         store,
+        upstream,
     });
     let issuance = Router::new()
         .route("/v1/jobs", post(issue_job))
         // Authentication wraps extraction, so unauthenticated bodies are never parsed.
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
-    Router::new()
+    Ok(Router::new()
         .route("/healthz", get(|| async { Json(Health { status: "ok" }) }))
         .merge(issuance)
-        .with_state(state)
+        .fallback(proxy_chat)
+        .method_not_allowed_fallback(proxy_chat)
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .with_state(state))
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -125,6 +138,117 @@ fn error(status: StatusCode, message: &'static str) -> Response {
         Json(json!({"error": {"message": message}})),
     )
         .into_response()
+}
+
+fn unauthorized() -> Response {
+    let mut response = error(StatusCode::UNAUTHORIZED, "Unauthorized");
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        header::HeaderValue::from_static("Bearer"),
+    );
+    response
+}
+
+async fn proxy_chat(State(state): State<Arc<ServiceState>>, request: Request) -> Response {
+    let Some(token) = bearer_token(request.headers()) else {
+        return unauthorized();
+    };
+    let token_hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not authenticate job",
+        );
+    };
+    let Ok(now) = i64::try_from(now.as_secs()) else {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not authenticate job",
+        );
+    };
+    let store = state.store.clone();
+    let key_id =
+        match tokio::task::spawn_blocking(move || store.active_job_key(token_hash, now)).await {
+            Ok(Ok(Some(key_id))) => key_id,
+            Ok(Ok(None)) => return unauthorized(),
+            Ok(Err(_)) | Err(_) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Could not authenticate job",
+                );
+            }
+        };
+    if request.method() != Method::POST || request.uri().path() != "/v1/chat/completions" {
+        return error(StatusCode::FORBIDDEN, "Forbidden route");
+    }
+    let Some(key) = state.config.upstream_keys.get(&key_id) else {
+        // A persisted job may reference a key removed from the startup pool.
+        return unauthorized();
+    };
+    let mut url = state.config.upstream_base_url.clone();
+    url.set_path(&format!(
+        "{}/v1/chat/completions",
+        url.path().trim_end_matches('/')
+    ));
+    url.set_query(request.uri().query());
+
+    // Authentication and route checks precede body reads. Reserialization gives
+    // the proxy and upstream identical JSON semantics, including duplicate keys.
+    let body = match Json::<Value>::from_request(request, &state).await {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            let status = if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                StatusCode::PAYLOAD_TOO_LARGE
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return error(status, "Invalid JSON request");
+        }
+    };
+    if !body.is_object()
+        || body
+            .get("stream")
+            .is_some_and(|stream| stream != &Value::Bool(false))
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "Only non-streaming chat is supported",
+        );
+    }
+
+    // Start a fresh request: no client credentials, cookies, routing headers,
+    // or hop-by-hop headers cross the upstream trust boundary.
+    let response = match state
+        .upstream
+        .post(url)
+        .bearer_auth(key)
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => return error(StatusCode::BAD_GATEWAY, "Upstream request failed"),
+    };
+    let status = response.status();
+    let mut headers = HeaderMap::new();
+    for name in [
+        header::CONTENT_TYPE,
+        header::CONTENT_ENCODING,
+        header::RETRY_AFTER,
+    ] {
+        for value in response.headers().get_all(&name) {
+            headers.append(name.clone(), value.clone());
+        }
+    }
+    let body = match response.bytes().await {
+        Ok(body) => body,
+        Err(_) => return error(StatusCode::BAD_GATEWAY, "Upstream request failed"),
+    };
+    headers.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    (status, headers, body).into_response()
 }
 
 fn positive_limit(value: Option<u64>, default: u64, maximum: u64) -> Option<i64> {
@@ -259,6 +383,8 @@ mod tests {
 
     use super::*;
 
+    mod proxy_tests;
+
     const CONTROL_TOKEN: &str = "private-control-credential";
     const UPSTREAM_SECRET: &str = "private-upstream-key";
     const JOB_ID: &str = "a6e024df-6080-411e-b0c2-5a0a94582112";
@@ -294,7 +420,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("jobs.sqlite3");
             let store = Store::open(&path).unwrap();
-            let app = router(config(path.clone()), store);
+            let app = router(config(path.clone()), store).unwrap();
             Self {
                 _directory: directory,
                 path,
@@ -447,7 +573,7 @@ mod tests {
         drop(fixture.app);
         let reopened = Store::open(&fixture.path).unwrap();
         assert_eq!(persisted(&fixture.path), row);
-        let restarted_app = router(config(fixture.path.clone()), reopened);
+        let restarted_app = router(config(fixture.path.clone()), reopened).unwrap();
         let (status, _, _) = issue(restarted_app, valid_body()).await;
         assert_eq!(status, StatusCode::CONFLICT);
         let bytes = std::fs::read(&fixture.path).unwrap();
@@ -602,7 +728,7 @@ mod tests {
             settings
                 .upstream_keys
                 .insert(key_id.clone(), UPSTREAM_SECRET.to_owned());
-            let app = router(settings, Store::open(&fixture.path).unwrap());
+            let app = router(settings, Store::open(&fixture.path).unwrap()).unwrap();
             let mut body = valid_body();
             body["ttl_seconds"] = json!(ttl);
             body["max_requests"] = json!(requests);
@@ -628,7 +754,7 @@ mod tests {
         settings.max_ttl_seconds = u64::MAX;
         settings.max_requests = u64::MAX;
         settings.max_tokens_total = u64::MAX;
-        let app = router(settings, Store::open(&fixture.path).unwrap());
+        let app = router(settings, Store::open(&fixture.path).unwrap()).unwrap();
         for field in ["ttl_seconds", "max_requests", "max_tokens_total"] {
             let mut body = valid_body();
             body[field] = json!(i64::MAX as u64 + 1);
@@ -666,7 +792,8 @@ mod tests {
         let other_app = router(
             config(fixture.path.clone()),
             Store::open(&fixture.path).unwrap(),
-        );
+        )
+        .unwrap();
         let mut other_body = valid_body();
         other_body["tenant_id"] = json!("other-tenant");
         let (first, second) = tokio::join!(
