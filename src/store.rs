@@ -2,7 +2,7 @@ use std::{
     fs::OpenOptions,
     path::Path,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -32,8 +32,21 @@ pub(crate) enum InsertError {
     Storage,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum JobTransition {
+    Revoke,
+    Done,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum TransitionError {
+    NotFound,
+    Conflict,
+    Storage,
+}
+
 impl Store {
-    /// Opens a persistent database and applies all pending schema migrations.
+    /// Opens a persistent database, migrates its schema, and expires overdue jobs.
     /// Call from startup or a blocking worker, never a Tokio executor thread.
     pub fn open(path: &Path) -> Result<Self> {
         if path.as_os_str().is_empty()
@@ -107,6 +120,13 @@ impl Store {
             .context("could not migrate database schema")?;
         }
         transaction
+            .execute(
+                "UPDATE jobs SET status = 'expired'
+                 WHERE status = 'active' AND expires_at <= ?1",
+                params![epoch_seconds()?],
+            )
+            .context("could not expire jobs at startup")?;
+        transaction
             .commit()
             .context("could not commit schema migration")?;
         Ok(Self {
@@ -145,28 +165,451 @@ impl Store {
         }
     }
 
-    /// Read admission state on a blocking worker. Lifecycle transitions are
-    /// implemented separately; this lookup never mutates job state or usage.
-    pub(crate) fn active_job_key(&self, token_hash: [u8; 32], now: i64) -> Result<Option<String>> {
-        let connection = self
+    /// Commits admission on a blocking worker, materializing expiry before lookup.
+    /// Admitted requests do not recheck state while their upstream call is running.
+    pub(crate) fn active_job_key(&self, token_hash: [u8; 32]) -> Result<Option<String>> {
+        let mut connection = self
             .connection
             .lock()
             .map_err(|_| anyhow::anyhow!("database lock failed"))?;
-        connection
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("could not begin job admission")?;
+        let key = active_job_key_in_transaction(&transaction, token_hash, epoch_seconds()?)?;
+        transaction
+            .commit()
+            .context("could not commit job admission")?;
+        Ok(key)
+    }
+
+    /// Materializes expiry before applying a terminal transition. The first
+    /// terminal state wins, including across independently opened connections.
+    pub(crate) fn transition_job(
+        &self,
+        job_id: &str,
+        transition: JobTransition,
+    ) -> Result<(), TransitionError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| TransitionError::Storage)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| TransitionError::Storage)?;
+        let now = epoch_seconds().map_err(|_| TransitionError::Storage)?;
+        transaction
+            .execute(
+                "UPDATE jobs SET status = 'expired'
+                 WHERE job_id = ?1 AND status = 'active' AND expires_at <= ?2",
+                params![job_id, now],
+            )
+            .map_err(|_| TransitionError::Storage)?;
+        let (target_status, revoked_at) = match transition {
+            JobTransition::Revoke => ("revoked", Some(now)),
+            JobTransition::Done => ("done", None),
+        };
+        let state = transaction
             .query_row(
-                "SELECT upstream_key_id FROM jobs
-                 WHERE token_hash = ?1 AND status = 'active' AND expires_at > ?2",
-                params![token_hash.as_slice(), now],
-                |row| row.get(0),
+                "SELECT status = 'active', status = ?2 FROM jobs WHERE job_id = ?1",
+                params![job_id, target_status],
+                |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
             )
             .optional()
-            .context("could not look up job")
+            .map_err(|_| TransitionError::Storage)?;
+        let outcome = match state {
+            None => Err(TransitionError::NotFound),
+            Some((true, _)) => {
+                transaction
+                    .execute(
+                        "UPDATE jobs SET status = ?2, revoked_at = ?3, revoked_reason = NULL
+                         WHERE job_id = ?1 AND status = 'active'",
+                        params![job_id, target_status, revoked_at],
+                    )
+                    .map_err(|_| TransitionError::Storage)?;
+                Ok(())
+            }
+            Some((false, true)) => Ok(()),
+            Some((false, false)) => Err(TransitionError::Conflict),
+        };
+        // Even a conflict must persist expiry materialized by this transaction.
+        transaction.commit().map_err(|_| TransitionError::Storage)?;
+        outcome
     }
+}
+
+fn epoch_seconds() -> Result<i64> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs();
+    i64::try_from(seconds).context("system clock exceeds the supported range")
+}
+
+fn active_job_key_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    token_hash: [u8; 32],
+    now: i64,
+) -> Result<Option<String>> {
+    transaction
+        .execute(
+            "UPDATE jobs SET status = 'expired'
+             WHERE token_hash = ?1 AND status = 'active' AND expires_at <= ?2",
+            params![token_hash.as_slice(), now],
+        )
+        .context("could not expire job during admission")?;
+    transaction
+        .query_row(
+            "SELECT upstream_key_id FROM jobs
+             WHERE token_hash = ?1 AND status = 'active' AND expires_at > ?2",
+            params![token_hash.as_slice(), now],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("could not look up job")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn insert_job(store: &Store, job_id: &str, token: u8, expires_at: i64) {
+        assert!(
+            store
+                .insert_job(NewJob {
+                    job_id: job_id.to_owned(),
+                    tenant_id: "tenant".to_owned(),
+                    upstream_key_id: "upstream".to_owned(),
+                    system_prompt: "system".to_owned(),
+                    token_hash: [token; 32],
+                    created_at: 1,
+                    expires_at,
+                    max_requests: 10,
+                    max_tokens_total: 1_000,
+                })
+                .is_ok()
+        );
+    }
+
+    fn job_state(connection: &Connection, job_id: &str) -> (String, Option<i64>, Option<String>) {
+        connection
+            .query_row(
+                "SELECT status, revoked_at, revoked_reason FROM jobs WHERE job_id = ?1",
+                params![job_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn admission_expires_at_the_exact_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open(&path).unwrap();
+        insert_job(&store, "before", 1, 999);
+        insert_job(&store, "boundary", 2, 1_000);
+        insert_job(&store, "after", 3, 1_001);
+
+        let mut connection = store.connection.lock().unwrap();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            active_job_key_in_transaction(&transaction, [1; 32], 1_000).unwrap(),
+            None
+        );
+        assert_eq!(
+            active_job_key_in_transaction(&transaction, [2; 32], 1_000).unwrap(),
+            None
+        );
+        assert_eq!(
+            active_job_key_in_transaction(&transaction, [3; 32], 1_000).unwrap(),
+            Some("upstream".to_owned())
+        );
+        transaction.commit().unwrap();
+        drop(connection);
+
+        let observer = Connection::open(&path).unwrap();
+        assert_eq!(job_state(&observer, "before").0, "expired");
+        assert_eq!(job_state(&observer, "boundary").0, "expired");
+        assert_eq!(job_state(&observer, "after").0, "active");
+    }
+
+    #[test]
+    fn admission_commits_expiry_only_for_the_matching_job() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open(&path).unwrap();
+        insert_job(&store, "overdue", 1, 2);
+        insert_job(&store, "unrelated", 2, 2);
+        insert_job(&store, "future", 3, i64::MAX);
+
+        assert_eq!(store.active_job_key([1; 32]).unwrap(), None);
+        assert_eq!(store.active_job_key([9; 32]).unwrap(), None);
+        assert_eq!(
+            store.active_job_key([3; 32]).unwrap(),
+            Some("upstream".to_owned())
+        );
+
+        let observer = Connection::open(&path).unwrap();
+        assert_eq!(
+            job_state(&observer, "overdue"),
+            ("expired".to_owned(), None, None)
+        );
+        assert_eq!(job_state(&observer, "unrelated").0, "active");
+        assert_eq!(job_state(&observer, "future").0, "active");
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(reopened.active_job_key([1; 32]).unwrap(), None);
+        assert_eq!(job_state(&observer, "overdue").0, "expired");
+    }
+
+    #[test]
+    fn startup_persists_expiry_without_overwriting_terminal_states() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open(&path).unwrap();
+        insert_job(&store, "overdue", 1, 2);
+        insert_job(&store, "future", 2, i64::MAX);
+        let observer = Connection::open(&path).unwrap();
+        let terminal_states = ["revoked", "done", "exhausted", "expired"];
+        for (index, status) in terminal_states.iter().enumerate() {
+            insert_job(&store, status, index as u8 + 3, 2);
+            observer
+                .execute(
+                    "UPDATE jobs SET status = ?2 WHERE job_id = ?1",
+                    params![status, status],
+                )
+                .unwrap();
+        }
+        observer
+            .execute(
+                "UPDATE jobs SET revoked_at = 2, revoked_reason = 'original reason'
+                 WHERE job_id = 'revoked'",
+                [],
+            )
+            .unwrap();
+        let snapshots: Vec<_> = terminal_states
+            .iter()
+            .map(|status| job_state(&observer, status))
+            .collect();
+        drop(store);
+
+        drop(Store::open(&path).unwrap());
+        assert_eq!(
+            job_state(&observer, "overdue"),
+            ("expired".to_owned(), None, None)
+        );
+        assert_eq!(job_state(&observer, "future").0, "active");
+        for (status, snapshot) in terminal_states.iter().zip(snapshots) {
+            assert_eq!(job_state(&observer, status), snapshot);
+        }
+        drop(Store::open(&path).unwrap());
+        assert_eq!(job_state(&observer, "overdue").0, "expired");
+    }
+
+    #[test]
+    fn terminal_transitions_are_durable_idempotent_and_conflicting() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open(&path).unwrap();
+        let observer = Connection::open(&path).unwrap();
+        let cases = [
+            ("revoked", 1, JobTransition::Revoke, JobTransition::Done),
+            ("done", 2, JobTransition::Done, JobTransition::Revoke),
+        ];
+        let mut snapshots = Vec::new();
+        for (job_id, token, transition, other_transition) in cases {
+            insert_job(&store, job_id, token, i64::MAX);
+            assert_eq!(store.transition_job(job_id, transition), Ok(()));
+            let state = job_state(&observer, job_id);
+            assert_eq!(state.0, job_id);
+            assert_eq!(state.2, None);
+            observer
+                .execute(
+                    "UPDATE jobs SET expires_at = 2 WHERE job_id = ?1",
+                    params![job_id],
+                )
+                .unwrap();
+            if transition == JobTransition::Revoke {
+                assert!(state.1.is_some_and(|timestamp| timestamp > 0));
+                // A fixed earlier timestamp makes accidental rewrites visible
+                // without sleeping across a wall-clock second.
+                observer
+                    .execute(
+                        "UPDATE jobs SET revoked_at = 2, revoked_reason = 'original reason'
+                         WHERE job_id = ?1",
+                        params![job_id],
+                    )
+                    .unwrap();
+            } else {
+                assert_eq!(state.1, None);
+            }
+            let snapshot = job_state(&observer, job_id);
+            assert_eq!(store.transition_job(job_id, transition), Ok(()));
+            assert_eq!(
+                store.transition_job(job_id, other_transition),
+                Err(TransitionError::Conflict)
+            );
+            assert_eq!(store.active_job_key([token; 32]).unwrap(), None);
+            assert_eq!(job_state(&observer, job_id), snapshot);
+            snapshots.push((job_id, snapshot));
+        }
+        drop(store);
+
+        let reopened = Store::open(&path).unwrap();
+        for (job_id, snapshot) in snapshots {
+            assert_eq!(job_state(&observer, job_id), snapshot);
+            let transition = if job_id == "revoked" {
+                JobTransition::Revoke
+            } else {
+                JobTransition::Done
+            };
+            assert_eq!(reopened.transition_job(job_id, transition), Ok(()));
+            assert_eq!(job_state(&observer, job_id), snapshot);
+        }
+    }
+
+    #[test]
+    fn transitions_persist_expiry_and_distinguish_missing_jobs() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open(&path).unwrap();
+        let observer = Connection::open(&path).unwrap();
+        for (job_id, token, transition) in [
+            ("overdue_revoke", 1, JobTransition::Revoke),
+            ("overdue_done", 2, JobTransition::Done),
+        ] {
+            insert_job(&store, job_id, token, 2);
+            assert_eq!(
+                store.transition_job(job_id, transition),
+                Err(TransitionError::Conflict)
+            );
+            assert_eq!(
+                job_state(&observer, job_id),
+                ("expired".to_owned(), None, None)
+            );
+            assert_eq!(
+                store.transition_job("missing", transition),
+                Err(TransitionError::NotFound)
+            );
+        }
+
+        insert_job(&store, "exhausted", 3, i64::MAX);
+        observer
+            .execute(
+                "UPDATE jobs SET status = 'exhausted' WHERE job_id = 'exhausted'",
+                [],
+            )
+            .unwrap();
+        for transition in [JobTransition::Revoke, JobTransition::Done] {
+            assert_eq!(
+                store.transition_job("exhausted", transition),
+                Err(TransitionError::Conflict)
+            );
+        }
+        assert_eq!(job_state(&observer, "exhausted").0, "exhausted");
+    }
+
+    #[test]
+    fn failed_transition_leaves_the_job_active() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open(&path).unwrap();
+        insert_job(&store, "job", 1, i64::MAX);
+        let observer = Connection::open(&path).unwrap();
+        observer
+            .execute_batch(
+                "CREATE TRIGGER reject_terminal_transition BEFORE UPDATE OF status ON jobs
+                 WHEN NEW.status IN ('revoked', 'done')
+                 BEGIN SELECT RAISE(ABORT, 'transition rejected'); END;",
+            )
+            .unwrap();
+        for transition in [JobTransition::Revoke, JobTransition::Done] {
+            assert_eq!(
+                store.transition_job("job", transition),
+                Err(TransitionError::Storage)
+            );
+            assert_eq!(
+                job_state(&observer, "job"),
+                ("active".to_owned(), None, None)
+            );
+        }
+    }
+
+    #[test]
+    fn independent_connections_serialize_competing_transitions() {
+        use std::sync::Barrier;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let first = Store::open(&path).unwrap();
+        let second = Store::open(&path).unwrap();
+        let observer = Connection::open(&path).unwrap();
+        let cases = [
+            (
+                "both_revoke",
+                1,
+                JobTransition::Revoke,
+                JobTransition::Revoke,
+                i64::MAX,
+            ),
+            (
+                "both_done",
+                2,
+                JobTransition::Done,
+                JobTransition::Done,
+                i64::MAX,
+            ),
+            (
+                "competing",
+                3,
+                JobTransition::Revoke,
+                JobTransition::Done,
+                i64::MAX,
+            ),
+            ("overdue", 4, JobTransition::Revoke, JobTransition::Done, 2),
+        ];
+        for (job_id, token, left_transition, right_transition, expires_at) in cases {
+            insert_job(&first, job_id, token, expires_at);
+            let barrier = Barrier::new(2);
+            let (left_result, right_result) = std::thread::scope(|scope| {
+                let left = scope.spawn(|| {
+                    barrier.wait();
+                    first.transition_job(job_id, left_transition)
+                });
+                let right = scope.spawn(|| {
+                    barrier.wait();
+                    second.transition_job(job_id, right_transition)
+                });
+                (left.join().unwrap(), right.join().unwrap())
+            });
+
+            if expires_at == 2 {
+                assert_eq!(left_result, Err(TransitionError::Conflict));
+                assert_eq!(right_result, Err(TransitionError::Conflict));
+                assert_eq!(job_state(&observer, job_id).0, "expired");
+                continue;
+            }
+            let winner = if left_transition == right_transition {
+                assert_eq!(left_result, Ok(()));
+                assert_eq!(right_result, Ok(()));
+                left_transition
+            } else {
+                match (left_result, right_result) {
+                    (Ok(()), Err(TransitionError::Conflict)) => left_transition,
+                    (Err(TransitionError::Conflict), Ok(())) => right_transition,
+                    results => panic!("expected exactly one terminal winner, got {results:?}"),
+                }
+            };
+            let status = match winner {
+                JobTransition::Revoke => "revoked",
+                JobTransition::Done => "done",
+            };
+            assert_eq!(job_state(&observer, job_id).0, status);
+            assert_eq!(first.active_job_key([token; 32]).unwrap(), None);
+            assert_eq!(second.transition_job(job_id, winner), Ok(()));
+        }
+    }
 
     #[test]
     fn migrations_survive_reopen_and_reject_newer_versions() {

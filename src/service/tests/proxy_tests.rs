@@ -113,7 +113,7 @@ async fn inactive_expired_missing_keys_and_storage_failures_never_forward() {
         StatusCode::UNAUTHORIZED
     );
     connection
-        .execute_batch("UPDATE jobs SET expires_at = 9223372036854775807")
+        .execute_batch("UPDATE jobs SET status = 'active', expires_at = 9223372036854775807")
         .unwrap();
     let mut settings = config(fixture.path.clone());
     settings.upstream_base_url = format!("http://{}", upstream.address).parse().unwrap();

@@ -6,7 +6,7 @@ use std::{
 use anyhow::Context;
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, FromRequest, Request, State, rejection::JsonRejection},
+    extract::{DefaultBodyLimit, FromRequest, Path, Request, State, rejection::JsonRejection},
     http::{HeaderMap, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use crate::{
     config::Config,
-    store::{InsertError, NewJob, Store},
+    store::{InsertError, JobTransition, NewJob, Store, TransitionError},
 };
 
 const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -73,14 +73,16 @@ pub fn router(config: Config, store: Store) -> anyhow::Result<Router> {
         store,
         upstream,
     });
-    let issuance = Router::new()
+    let control = Router::new()
         .route("/v1/jobs", post(issue_job))
+        .route("/v1/jobs/{job_id}/revoke", post(revoke_job))
+        .route("/v1/jobs/{job_id}/done", post(finish_job))
         // Authentication wraps extraction, so unauthenticated bodies are never parsed.
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
     Ok(Router::new()
         .route("/healthz", get(|| async { Json(Health { status: "ok" }) }))
-        .merge(issuance)
+        .merge(control)
         .fallback(proxy_chat)
         .method_not_allowed_fallback(proxy_chat)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
@@ -154,30 +156,17 @@ async fn proxy_chat(State(state): State<Arc<ServiceState>>, request: Request) ->
         return unauthorized();
     };
     let token_hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
-    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
-        return error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Could not authenticate job",
-        );
-    };
-    let Ok(now) = i64::try_from(now.as_secs()) else {
-        return error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Could not authenticate job",
-        );
-    };
     let store = state.store.clone();
-    let key_id =
-        match tokio::task::spawn_blocking(move || store.active_job_key(token_hash, now)).await {
-            Ok(Ok(Some(key_id))) => key_id,
-            Ok(Ok(None)) => return unauthorized(),
-            Ok(Err(_)) | Err(_) => {
-                return error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Could not authenticate job",
-                );
-            }
-        };
+    let key_id = match tokio::task::spawn_blocking(move || store.active_job_key(token_hash)).await {
+        Ok(Ok(Some(key_id))) => key_id,
+        Ok(Ok(None)) => return unauthorized(),
+        Ok(Err(_)) | Err(_) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not authenticate job",
+            );
+        }
+    };
     if request.method() != Method::POST || request.uri().path() != "/v1/chat/completions" {
         return error(StatusCode::FORBIDDEN, "Forbidden route");
     }
@@ -249,6 +238,47 @@ async fn proxy_chat(State(state): State<Arc<ServiceState>>, request: Request) ->
         header::HeaderValue::from_static("no-store"),
     );
     (status, headers, body).into_response()
+}
+
+async fn revoke_job(
+    State(state): State<Arc<ServiceState>>,
+    Path(job_id): Path<String>,
+) -> Response {
+    transition_job(state, job_id, JobTransition::Revoke).await
+}
+
+async fn finish_job(
+    State(state): State<Arc<ServiceState>>,
+    Path(job_id): Path<String>,
+) -> Response {
+    transition_job(state, job_id, JobTransition::Done).await
+}
+
+async fn transition_job(
+    state: Arc<ServiceState>,
+    job_id: String,
+    transition: JobTransition,
+) -> Response {
+    let Ok(job_id) = Uuid::parse_str(&job_id) else {
+        return error(StatusCode::BAD_REQUEST, "Invalid job request");
+    };
+    let store = state.store.clone();
+    match tokio::task::spawn_blocking(move || store.transition_job(&job_id.to_string(), transition))
+        .await
+    {
+        Ok(Ok(())) => (
+            StatusCode::NO_CONTENT,
+            [(header::CACHE_CONTROL, "no-store")],
+        )
+            .into_response(),
+        Ok(Err(TransitionError::NotFound)) => error(StatusCode::NOT_FOUND, "Job not found"),
+        Ok(Err(TransitionError::Conflict)) => {
+            error(StatusCode::CONFLICT, "Job is already inactive")
+        }
+        Ok(Err(TransitionError::Storage)) | Err(_) => {
+            error(StatusCode::INTERNAL_SERVER_ERROR, "Could not update job")
+        }
+    }
 }
 
 fn positive_limit(value: Option<u64>, default: u64, maximum: u64) -> Option<i64> {
@@ -383,6 +413,7 @@ mod tests {
 
     use super::*;
 
+    mod lifecycle_tests;
     mod proxy_tests;
 
     const CONTROL_TOKEN: &str = "private-control-credential";
