@@ -126,6 +126,19 @@ impl Config {
                 )));
             }
         }
+        match self.control_token.as_deref() {
+            None => {
+                return Err(ConfigError::Validation(
+                    "control_token is required (set RUSTGATE_CONTROL_TOKEN or RUSTGATE_CONTROL_TOKEN_FILE); the control plane must not be unauthenticated".into(),
+                ))
+            }
+            Some(tok) if tok.trim().is_empty() => {
+                return Err(ConfigError::Validation(
+                    "control_token is empty — refusing to authorize the control plane with a blank credential".into(),
+                ))
+            }
+            _ => {}
+        }
         if !self.allow_insecure {
             match (&self.tls_cert_path, &self.tls_key_path) {
                 (None, None) => {

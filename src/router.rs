@@ -5,6 +5,13 @@ use crate::proxy;
 use crate::state::SharedState;
 
 pub fn router(state: SharedState) -> Router {
+    // The fallback proxy handler extracts the whole body with `Bytes`,
+    // which is subject to Axum's DefaultBodyLimit (2 MiB by default). Align
+    // the extractor limit with the configured policy cap so an allowed
+    // 3 MiB body is not 413'd before PolicyEngine::check_body can return
+    // the intended policy verdict. +1 KiB of slack so the policy check (not
+    // the extractor) is what rejects at-cap bodies.
+    let limit = state.cfg.request_size_limit_bytes.saturating_add(1024);
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/metrics", get(metrics_handler))
@@ -13,6 +20,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/v1/jobs/{job_id}/done", post(control::done_job))
         .route("/v1/job/me", get(job_me))
         .fallback(proxy::proxy)
+        .layer(axum::extract::DefaultBodyLimit::max(limit))
         .with_state(state)
 }
 

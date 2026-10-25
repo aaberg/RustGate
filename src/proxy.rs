@@ -262,20 +262,23 @@ async fn forward(
         .header("authorization", adapter.auth_header(&key))
         .header("content-type", content_type);
 
+    // The body may reach the upstream as soon as send() is polled: from
+    // here, cancellation settles CONSERVATIVELY (consume + charge the
+    // estimate). Returned connect/builder errors are explicitly refunded
+    // below, since they provably precede forwarding.
+    guard.mode = Some(SettleMode::Consume);
+
     let upstream_resp = match req.body(fwd_body).send().await {
         Ok(r) => r,
         Err(e) => {
-            // send() definitively ran: from here the guard settles as
-            // ambiguous/consume. The settlement itself runs in a spawned
-            // task that survives cancellation, and the guard is disarmed
-            // only after the task is *spawned* (not awaited to completion
-            // in this future).
+            // The settlement task owns the ONLY in_flight decrement; the
+            // error response must be returned through the Ok path so the
+            // outer handler does not decrement a second time.
             let is_connect_phase = e.is_connect() || e.is_builder();
             let mode = if is_connect_phase { SettleMode::Release } else { SettleMode::Consume };
             guard.settle_and_disarm(mode);
             let msg = e.to_string();
             tracing::warn!(job_id = %job.job_id, path = %path, "upstream forward failed: {msg}");
-            let _st = state.clone();
             let log_entry = LogEntry {
                 job_id: job.job_id.clone(),
                 ts: Utc::now(),
@@ -292,14 +295,16 @@ async fn forward(
                 block_reason: None,
             };
             state.store.log_request_async(log_entry).await;
-            return Err(ApiError::Upstream(msg).into_response());
+            let e = ApiError::Upstream(msg);
+            return Ok((e.into_response(), false));
         }
     };
 
-    // Response headers received: the request definitively reached the
-    // upstream. The guard settles as consume, and from here on the
-    // stream/buffered finalizers own cleanup (guard disarmed below).
-    guard.settle_and_disarm(SettleMode::Consume);
+    // Response headers received: the call definitively burned. Ownership of
+    // the request-slot consumption and token reconciliation transfers to the
+    // response finalizer (stream or buffered), which performs each exactly
+    // once. The guard is disarmed without settling (hand-over, not charge).
+    guard.hand_over();
     state.store.consume_request_async(job.job_id.clone()).await;
 
     let status = upstream_resp.status();
@@ -544,9 +549,14 @@ async fn forward(
                 return Ok((e.into_response(), false));
             }
             Err(e) => {
-                // Join error (task panicked/cancelled): the task may not
-                // have balanced. Let the outer handler handle the gauge.
-                return Err(ApiError::Internal(format!("download task: {e}")).into_response());
+                // Join error (task panicked mid-download). The task owned
+                // the finalize/gauge/permit cleanup; both decrement branches
+                // are the task's last statements, so a panic above them
+                // leaks at most one increment — a bug to fix at the source,
+                // not compensate for. Returned via Ok so the outer handler
+                // never double-decrements.
+                let err = ApiError::Internal(format!("download task: {e}"));
+                return Ok((err.into_response(), false));
             }
         };
         let mut builder = Response::builder()
@@ -650,6 +660,18 @@ struct AccountingGuard {
 }
 
 impl AccountingGuard {
+    /// Transfer cleanup ownership to a finalizer (stream or buffered body)
+    /// without settling: the guard disarms (Drop is a no-op) and the
+    /// finalizer must perform the request consumption and token
+    /// reconciliation exactly once. `counted` stays with the guard's gauge
+    /// responsibility — the finalizer decrements in_flight.
+    fn hand_over(&mut self) {
+        self.settled = true;
+        self.counted = false; // finalizer owns the in_flight decrement
+        self.holds_request = false; // consumed below, outside the guard
+        self.holds_tokens = false; // reconciled by the finalizer
+    }
+
     /// Run the settlement in a cancellation-immune spawned task and disarm
     /// the guard immediately (the task owns cleanup from this point).
     fn settle_and_disarm(&mut self, mode: SettleMode) {

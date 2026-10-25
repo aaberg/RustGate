@@ -43,7 +43,10 @@ async fn mock_upstream_app(
                                 yield Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(chunk));
                                 tokio::time::sleep(std::time::Duration::from_millis(30)).await;
                             }
-                            yield Ok(bytes::Bytes::from("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n"));
+                            // Usage event split across two data: lines
+                            // (legal SSE multi-field assembly).
+                            yield Ok(bytes::Bytes::from("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":\n"));
+                            yield Ok(bytes::Bytes::from("data: 10,\"completion_tokens\":5}}\n\n"));
                             yield Ok(bytes::Bytes::from("data: [DONE]\n\n"));
                         };
                         axum::response::Response::builder()

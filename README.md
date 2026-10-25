@@ -86,7 +86,7 @@ TLS is required in production (dev plain HTTP needs `RUSTGATE_ALLOW_INSECURE=1`)
 | `RUSTGATE_TLS_CERT` / `RUSTGATE_TLS_KEY` | TLS cert/key paths (PEM) | none (required unless insecure dev) |
 | `RUSTGATE_SQLITE_PATH` | SQLite database path | `rustgate.db` |
 | `RUSTGATE_SECRETS_FILE` | Upstream key pool file (see below) | none |
-| `RUSTGATE_CONTROL_TOKEN` (or `RUSTGATE_CONTROL_TOKEN_FILE`) | Control-plane bearer token | none |
+| `RUSTGATE_CONTROL_TOKEN` (or `RUSTGATE_CONTROL_TOKEN_FILE`) | Control-plane bearer token (required, non-empty — the control plane is unusable without it) | none |
 | `RUSTGATE_KEY_<ID>` | Upstream key, `provider:sk-...` (dev fallback) | — |
 | `RUSTGATE_UPSTREAM_BASE_URL` | Overrides the `mistral` provider base URL | `https://api.mistral.ai` |
 | `RUSTGATE_PUBLIC_BASE_URL` | Advertised proxy URL in issuance responses (use when the bind address isn't client-reachable, e.g. `0.0.0.0`, or behind a reverse proxy) | derived from listener |

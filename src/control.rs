@@ -19,11 +19,20 @@ pub fn check_control_auth(headers: &HeaderMap, state: &SharedState) -> Result<()
         .as_deref()
         .filter(|token| !token.trim().is_empty())
         .ok_or(ApiError::Unauthorized)?;
+    // A blank configured credential must never authorize: an empty bearer
+    // would trivially "match" an empty token in constant-time comparison.
+    if expected.is_empty() {
+        tracing::error!("control_token configured as empty; rejecting control-plane request");
+        return Err(ApiError::Unauthorized);
+    }
     let got = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or(ApiError::Unauthorized)?;
+    if got.is_empty() {
+        return Err(ApiError::Unauthorized);
+    }
     // constant-time compare
     if subtle::ConstantTimeEq::ct_eq(got.as_bytes(), expected.as_bytes()).into() {
         Ok(())
