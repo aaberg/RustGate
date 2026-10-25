@@ -74,7 +74,8 @@ pub(super) async fn forward(
     );
 
     let Some(first) = first else {
-        accounting.finish(completed, usage.finish()).await;
+        drop(response);
+        tokio::spawn(accounting.finish(completed, usage.finish()));
         return (status, headers, Body::empty()).into_response();
     };
     // Account bytes already received even if the downstream disconnects before
@@ -140,9 +141,12 @@ pub(super) async fn forward(
             // connection subsequently fails. Partial JSON never becomes usage.
             usage.observed()
         };
-        accounting.finish(outcome, known).await;
+        // Transport completion must not wait for SQLite. The relay future has
+        // already dropped upstream; retain accounting (and its permit) here
+        // until the blocking reconciliation worker finishes.
         drop(sender);
         let _ = finished.send(result);
+        accounting.finish(outcome, known).await;
     });
     let chunks = stream::unfold(
         (receiver, Some(terminal)),

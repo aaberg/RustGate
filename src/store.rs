@@ -1,6 +1,6 @@
 use std::{
-    fs::OpenOptions,
-    path::Path,
+    fs::{File, OpenOptions},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -12,7 +12,13 @@ const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Clone)]
 pub struct Store {
-    connection: Arc<Mutex<Connection>>,
+    inner: Arc<StoreInner>,
+}
+
+struct StoreInner {
+    connection: Mutex<Connection>,
+    // Dropped after the connection, only when the final worker or owner releases it.
+    _ownership: Option<File>,
 }
 
 pub(crate) struct NewJob {
@@ -67,38 +73,59 @@ pub(crate) enum TransitionError {
 }
 
 impl Store {
-    /// Opens a persistent database, migrates its schema, and reconciles interrupted requests.
-    /// Startup assumes this service is the sole owner of the database: opening a
-    /// second Store interrupts any pending requests, including another live Store's.
+    /// Opens with externally managed ownership, migrates, and recovers interrupted requests.
+    /// The caller must exclude other live owners for the lifetime of every clone.
     /// Call from startup or a blocking worker, never a Tokio executor thread.
     pub fn open(path: &Path) -> Result<Self> {
-        if path.as_os_str().is_empty()
-            || path == Path::new(":memory:")
-            || path.to_string_lossy().starts_with("file:")
-        {
-            bail!("database_path must identify a persistent filesystem database");
-        }
+        let path = prepare_database(path)?;
+        Self::open_owned(&path, None)
+    }
 
+    /// Exclusively owns startup and recovery until the final Store clone is dropped.
+    /// The persistent sidecar must not be removed or replaced while owners may exist.
+    /// Call from startup or a blocking worker, never a Tokio executor thread.
+    pub fn open_exclusive(path: &Path) -> Result<Self> {
+        let path = prepare_database(path)?;
+        let mut lock_name = path.as_os_str().to_os_string();
+        lock_name.push(".lock");
+        let lock_path = PathBuf::from(lock_name);
+        match std::fs::symlink_metadata(&lock_path) {
+            Ok(metadata) if !metadata.file_type().is_file() => {
+                bail!("database ownership lock must be a regular, non-symlink file");
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("could not inspect database ownership lock"),
+        }
         let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
+        options.read(true).write(true).create(true).truncate(false);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        match options.open(path) {
-            Ok(file) => drop(file),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error).context("could not create database file"),
-        }
-        if !path
+        let lock = options
+            .open(&lock_path)
+            .context("could not open database ownership lock")?;
+        let metadata = lock
             .metadata()
-            .context("could not inspect database file")?
-            .is_file()
-        {
-            bail!("database_path must identify a regular file");
+            .context("could not inspect ownership lock")?;
+        if !metadata.is_file() {
+            bail!("database ownership lock must be a regular file");
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.nlink() != 1 {
+                bail!("database ownership lock must not have hard-link aliases");
+            }
+        }
+        lock.try_lock()
+            .context("database is already owned or filesystem locking is unavailable")?;
+        Self::open_owned(&path, Some(lock))
+    }
 
+    fn open_owned(path: &Path, ownership: Option<File>) -> Result<Self> {
         let mut connection = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -197,13 +224,20 @@ impl Store {
             .commit()
             .context("could not commit schema migration")?;
         Ok(Self {
-            connection: Arc::new(Mutex::new(connection)),
+            inner: Arc::new(StoreInner {
+                connection: Mutex::new(connection),
+                _ownership: ownership,
+            }),
         })
     }
 
     /// A single INSERT makes duplicate detection atomic across connections.
     pub(crate) fn insert_job(&self, job: NewJob) -> Result<(), InsertError> {
-        let connection = self.connection.lock().map_err(|_| InsertError::Storage)?;
+        let connection = self
+            .inner
+            .connection
+            .lock()
+            .map_err(|_| InsertError::Storage)?;
         match connection.execute(
             "INSERT INTO jobs (
                 job_id, tenant_id, upstream_key_id, system_prompt, token_hash,
@@ -236,6 +270,7 @@ impl Store {
     /// The final permitted request keeps its snapshot even though it exhausts the job.
     pub(crate) fn admit_job(&self, token_hash: [u8; 32]) -> Result<JobAdmission> {
         let mut connection = self
+            .inner
             .connection
             .lock()
             .map_err(|_| anyhow::anyhow!("database lock failed"))?;
@@ -272,6 +307,7 @@ impl Store {
             bail!("invalid request token usage");
         }
         let mut connection = self
+            .inner
             .connection
             .lock()
             .map_err(|_| anyhow::anyhow!("database lock failed"))?;
@@ -292,6 +328,7 @@ impl Store {
         transition: JobTransition,
     ) -> Result<(), TransitionError> {
         let mut connection = self
+            .inner
             .connection
             .lock()
             .map_err(|_| TransitionError::Storage)?;
@@ -337,6 +374,45 @@ impl Store {
         transaction.commit().map_err(|_| TransitionError::Storage)?;
         outcome
     }
+}
+
+fn prepare_database(path: &Path) -> Result<PathBuf> {
+    if path.as_os_str().is_empty()
+        || path == Path::new(":memory:")
+        || path.to_string_lossy().starts_with("file:")
+    {
+        bail!("database_path must identify a persistent filesystem database");
+    }
+    // Validate an existing target before opening it (notably devices and FIFOs).
+    match path.metadata() {
+        Ok(metadata) if !metadata.is_file() => {
+            bail!("database_path must identify a regular file");
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("could not inspect database file"),
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(file) => drop(file),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error).context("could not create database file"),
+    }
+    if !path
+        .metadata()
+        .context("could not inspect database file")?
+        .is_file()
+    {
+        bail!("database_path must identify a regular file");
+    }
+    path.canonicalize()
+        .context("could not resolve database path")
 }
 
 fn epoch_seconds() -> Result<i64> {
@@ -487,6 +563,176 @@ mod tests {
         );
     }
 
+    #[test]
+    fn exclusive_worker_retains_ownership_and_known_usage_after_root_drop() {
+        use std::sync::mpsc;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open_exclusive(&path).unwrap();
+        insert_job(&store, "job", 1, i64::MAX);
+        let JobAdmission::Admitted(admitted) = store.admit_job([1; 32]).unwrap() else {
+            panic!("request must be admitted");
+        };
+        let worker_store = store.clone();
+        let observer = Connection::open(&path).unwrap();
+        // An actual SQLite write transaction blocks reconciliation deterministically.
+        observer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let connection = worker_store.inner.connection.lock().unwrap();
+            started_tx.send(()).unwrap();
+            drop(connection);
+            worker_store
+                .finish_request(
+                    admitted.request_id,
+                    "completed",
+                    Some(Usage {
+                        prompt_tokens: 7,
+                        completion_tokens: 5,
+                        total_tokens: 12,
+                    }),
+                )
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        drop(store);
+        assert!(Store::open_exclusive(&path).is_err());
+        let outcome: String = observer
+            .query_row("SELECT outcome FROM request_records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(outcome, "pending");
+        observer.execute_batch("COMMIT").unwrap();
+        worker.join().unwrap();
+        let reopened = Store::open_exclusive(&path).unwrap();
+        let record: (String, Option<i64>, i64, i64) = observer
+            .query_row(
+                "SELECT outcome, total_tokens, tokens_used, tokens_reserved
+             FROM request_records JOIN jobs USING (job_id)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(record, ("completed".to_owned(), Some(12), 12, 0));
+        drop(reopened);
+        assert!(directory.path().join("jobs.sqlite3.lock").is_file());
+    }
+
+    #[test]
+    fn exclusive_clone_blocks_recovery_until_last_owner_drops() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open_exclusive(&path).unwrap();
+        insert_job(&store, "job", 1, i64::MAX);
+        assert!(matches!(
+            store.admit_job([1; 32]).unwrap(),
+            JobAdmission::Admitted(_)
+        ));
+        let clone = store.clone();
+        drop(store);
+        assert!(Store::open_exclusive(&path).is_err());
+        drop(clone);
+        let reopened = Store::open_exclusive(&path).unwrap();
+        let connection = reopened.inner.connection.lock().unwrap();
+        let record: (String, Option<i64>, i64) = connection
+            .query_row(
+                "SELECT outcome, total_tokens, tokens_reserved
+             FROM request_records JOIN jobs USING (job_id)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(record, ("interrupted".to_owned(), None, 0));
+    }
+
+    #[test]
+    fn sidecar_does_not_lock_sqlite_bytes_and_relative_aliases_contend() {
+        let directory = tempfile::tempdir_in(".").unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open_exclusive(&path).unwrap();
+        let absolute = path.canonicalize().unwrap();
+        assert!(Store::open_exclusive(&absolute).is_err());
+        let observer = Connection::open(&path).unwrap();
+        observer.execute_batch(
+            "BEGIN IMMEDIATE; CREATE TABLE lock_probe (value INTEGER); INSERT INTO lock_probe VALUES (1); COMMIT;"
+        ).unwrap();
+        assert_eq!(
+            observer
+                .query_row("SELECT value FROM lock_probe", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let database = File::open(&path).unwrap();
+        database.try_lock().unwrap();
+        drop(database);
+        let sidecar = directory.path().join("jobs.sqlite3.lock");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            assert_ne!(
+                path.metadata().unwrap().ino(),
+                sidecar.metadata().unwrap().ino()
+            );
+            assert_eq!(
+                sidecar.metadata().unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        drop(store);
+        assert!(Store::open_exclusive(&absolute).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_aliases_share_the_canonical_sidecar() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open_exclusive(&path).unwrap();
+        let alias = directory.path().join("alias.sqlite3");
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        assert!(Store::open_exclusive(&alias).is_err());
+        assert!(!directory.path().join("alias.sqlite3.lock").exists());
+        drop(store);
+        assert!(Store::open_exclusive(&alias).is_ok());
+    }
+
+    #[test]
+    fn exclusive_open_rejects_invalid_paths_before_creating_files() {
+        assert!(Store::open_exclusive(Path::new("")).is_err());
+        assert!(Store::open_exclusive(Path::new(":memory:")).is_err());
+        assert!(Store::open_exclusive(Path::new("file:invalid.sqlite3")).is_err());
+        let directory = tempfile::tempdir().unwrap();
+        assert!(Store::open_exclusive(directory.path()).is_err());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exclusive_open_rejects_sidecar_aliases_and_special_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        drop(Store::open(&path).unwrap());
+        let sidecar = directory.path().join("jobs.sqlite3.lock");
+        std::os::unix::fs::symlink(&path, &sidecar).unwrap();
+        assert!(Store::open_exclusive(&path).is_err());
+        std::fs::remove_file(&sidecar).unwrap();
+        std::fs::hard_link(&path, &sidecar).unwrap();
+        assert!(Store::open_exclusive(&path).is_err());
+        std::fs::remove_file(&sidecar).unwrap();
+        std::fs::create_dir(&sidecar).unwrap();
+        assert!(Store::open_exclusive(&path).is_err());
+        // A device must be rejected without attempting creation, SQLite, or locking.
+        assert!(Store::open_exclusive(Path::new("/dev/null")).is_err());
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+    }
+
     fn job_state(connection: &Connection, job_id: &str) -> (String, Option<i64>, Option<String>) {
         connection
             .query_row(
@@ -516,7 +762,7 @@ mod tests {
         insert_job(&store, "boundary", 2, 1_000);
         insert_job(&store, "after", 3, 1_001);
 
-        let mut connection = store.connection.lock().unwrap();
+        let mut connection = store.inner.connection.lock().unwrap();
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .unwrap();

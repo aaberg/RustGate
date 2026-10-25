@@ -685,6 +685,7 @@ async fn concurrent_admissions_stop_at_the_persisted_allowance_across_restart() 
     }
     assert_eq!((admitted, denied), (3, 29));
     assert_eq!(captures(mock.clone()).await.as_array().unwrap().len(), 5);
+    wait_for_accounting(&fixture).await;
     let charged = persisted(&fixture.path);
     assert_eq!(charged["requests_used"], 5);
     assert_eq!(charged["tokens_used"], 40);
@@ -785,6 +786,7 @@ async fn ordinary_usage_distinguishes_known_zero_missing_and_local_rejection() {
         send(fixture.app.clone(), chat("{", Some(&token))).await.0,
         StatusCode::BAD_REQUEST
     );
+    wait_for_accounting(&fixture).await;
     let observer = Connection::open(&fixture.path).unwrap();
     let records: Vec<(String, Option<i64>)> = observer
         .prepare("SELECT outcome, total_tokens FROM request_records ORDER BY request_id")

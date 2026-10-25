@@ -115,6 +115,81 @@ async fn recovered(fixture: &Fixture, token: &str) {
         }
     })
     .await;
+    wait_for_accounting(fixture).await;
+}
+
+async fn deadline_transport_precedes_contended_accounting(overall: bool) {
+    let (fixture, _server, chunks, mut captures) = fixture(|settings| {
+        settings.max_in_flight_requests = 1;
+        if overall {
+            settings.overall_timeout_seconds = 2;
+        } else {
+            settings.idle_timeout_seconds = 2;
+        }
+    })
+    .await;
+    let token = token(&fixture).await;
+    let report =
+        b"data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n\n";
+    chunks.send(Ok(Bytes::from_static(report))).await.unwrap();
+    let response = bounded(fixture.app.clone().oneshot(chat(payload(), &token)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    bounded(captures.recv()).await.unwrap();
+    let mut body = response.into_body().into_data_stream();
+    assert_eq!(
+        bounded(body.next()).await.unwrap().unwrap().as_ref(),
+        report
+    );
+
+    // Reading the report synchronizes admission and known usage before taking
+    // the external writer lock. Keep it held until transport termination and
+    // capacity checks have both completed, rather than releasing on a timer.
+    let writer = Connection::open(&fixture.path).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert_eq!(accounting_record(&fixture), ("pending".to_owned(), None));
+    let terminal = tokio::time::timeout(Duration::from_secs(4), body.next())
+        .await
+        .expect("deadline transport error waited for the SQLite writer");
+    assert!(terminal.expect("deadline became clean EOF").is_err());
+    bounded(chunks.closed()).await;
+    assert_eq!(accounting_record(&fixture), ("pending".to_owned(), None));
+    assert_eq!(persisted(&fixture.path)["tokens_used"], 0);
+    let (status, headers, error) =
+        bounded(send(fixture.app.clone(), chat(payload(), &token))).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(headers[header::RETRY_AFTER], "1");
+    assert_private_error(&error);
+    assert_eq!(persisted(&fixture.path)["requests_used"], 1);
+    assert!(captures.try_recv().is_err());
+
+    writer.execute_batch("COMMIT").unwrap();
+    wait_for_accounting(&fixture).await;
+    assert_eq!(accounting_record(&fixture), ("timeout".to_owned(), Some(8)));
+    assert_eq!(persisted(&fixture.path)["tokens_used"], 8);
+    let usage: (i64, i64, i64) = writer
+        .query_row(
+            "SELECT prompt_tokens, completion_tokens, total_tokens
+             FROM request_records ORDER BY request_id LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(usage, (5, 3, 8));
+    recovered(&fixture, &token).await;
+    assert_eq!(persisted(&fixture.path)["requests_used"], 2);
+    assert_eq!(persisted(&fixture.path)["tokens_used"], 8);
+}
+
+#[tokio::test]
+async fn idle_deadline_terminates_transport_while_sqlite_writer_holds_accounting() {
+    deadline_transport_precedes_contended_accounting(false).await;
+}
+
+#[tokio::test]
+async fn overall_deadline_terminates_transport_while_sqlite_writer_holds_accounting() {
+    deadline_transport_precedes_contended_accounting(true).await;
 }
 
 #[tokio::test]
@@ -158,6 +233,7 @@ async fn sse_chunks_arrive_before_eof_with_authoritative_prompt_and_no_buffering
     );
     drop(chunks);
     assert!(bounded(body.next()).await.is_none());
+    wait_for_accounting(&fixture).await;
     assert_eq!(persisted(&fixture.path)["requests_used"], 1);
     assert!(captures.try_recv().is_err());
 }
@@ -211,6 +287,7 @@ async fn idle_deadline_after_commit_is_a_transport_error_not_an_sse_event() {
     bounded(captures.recv()).await.unwrap();
     assert!(captures.try_recv().is_err());
     assert_eq!(persisted(&fixture.path)["requests_used"], 1);
+    wait_for_accounting(&fixture).await;
     assert_eq!(accounting_record(&fixture), ("timeout".to_owned(), None));
 }
 
@@ -276,6 +353,7 @@ async fn overall_deadline_covers_stalled_incoming_body_and_releases_capacity() {
     assert_private_error(&body);
     assert!(captures.try_recv().is_err());
     assert_eq!(persisted(&fixture.path)["requests_used"], 1);
+    wait_for_accounting(&fixture).await;
     // A malformed request needs no upstream stream but still must acquire capacity.
     let (status, _, _) = bounded(send(fixture.app.clone(), chat("{", &token))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -587,6 +665,7 @@ async fn streaming_usage_reconciles_after_done_without_double_counting_reports()
     }
     drop(chunks);
     assert!(bounded(body.next()).await.is_none());
+    wait_for_accounting(&fixture).await;
     assert_eq!(
         accounting_record(&fixture),
         ("completed".to_owned(), Some(8))
@@ -619,6 +698,7 @@ async fn broken_stream_usage_is_unknown_unless_a_complete_report_was_received() 
             .await
             .unwrap();
         assert!(bounded(body.next()).await.unwrap().is_err());
+        wait_for_accounting(&fixture).await;
         assert_eq!(
             accounting_record(&fixture),
             (

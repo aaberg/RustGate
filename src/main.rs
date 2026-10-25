@@ -13,26 +13,9 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|_| anyhow::anyhow!("could not load TLS certificate and private key"))?;
     let database_path = config.database_path.clone();
-    let (store, _database_lock) = tokio::task::spawn_blocking(move || {
-        // Recovery may only interrupt requests from a dead service. Hold an OS
-        // lock on the database inode until shutdown; a crash releases it too.
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let lock = options
-            .open(&database_path)
-            .context("could not open database ownership lock")?;
-        lock.try_lock()
-            .context("database is already owned or filesystem locking is unavailable")?;
-        let store = Store::open(&database_path)?;
-        Ok::<_, anyhow::Error>((store, lock))
-    })
-    .await
-    .context("database startup task failed")??;
+    let store = tokio::task::spawn_blocking(move || Store::open_exclusive(&database_path))
+        .await
+        .context("database startup task failed")??;
     let listener = TcpListener::bind(config.listen_addr)
         .await
         .context("could not bind service listener")?;

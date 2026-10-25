@@ -571,6 +571,27 @@ mod tests {
         (status, headers, body)
     }
 
+    async fn wait_for_accounting(fixture: &Fixture) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let pending: i64 = Connection::open(&fixture.path)
+                    .unwrap()
+                    .query_row(
+                        "SELECT COUNT(*) FROM request_records WHERE outcome = 'pending'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                if pending == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("durable request accounting did not complete");
+    }
+
     async fn issue(app: Router, body: Value) -> (StatusCode, HeaderMap, Value) {
         send(app, request(body.to_string(), Some(CONTROL_TOKEN))).await
     }
