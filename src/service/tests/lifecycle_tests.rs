@@ -529,7 +529,12 @@ async fn admitted_requests_finish_after_terminal_transition_even_before_body_rea
             "Completed after the job became terminal"
         );
         assert_eq!(upstream.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(persisted(&fixture.path), terminal);
+        wait_for_accounting(&fixture).await;
+        let reconciled = persisted(&fixture.path);
+        assert_eq!(reconciled["status"], terminal["status"]);
+        assert_eq!(reconciled["requests_used"], 1);
+        assert_eq!(reconciled["tokens_used"], 13);
+        assert_eq!(reconciled["revoked_at"], terminal["revoked_at"]);
     }
 }
 

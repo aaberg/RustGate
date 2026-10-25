@@ -7,18 +7,18 @@ use axum::{
 };
 use futures_util::stream;
 use tokio::{
-    sync::{OwnedSemaphorePermit, mpsc, oneshot},
+    sync::{mpsc, oneshot},
     time::{Instant, timeout, timeout_at},
 };
 
-use super::error;
+use super::{accounting::Accounting, error, usage::UsageTracker};
 
 /// Wait for an actual body byte (or clean EOF), not just response headers.
 /// Nothing is committed downstream until this succeeds, allowing a useful
 /// gateway status for connection and first-byte failures.
 pub(super) async fn forward(
     request: reqwest::RequestBuilder,
-    permit: OwnedSemaphorePermit,
+    mut accounting: Accounting,
     overall_deadline: Instant,
     first_byte_timeout: Duration,
     idle_timeout: Duration,
@@ -38,13 +38,26 @@ pub(super) async fn forward(
     let (response, first) = match first {
         Ok(Ok(response)) => response,
         Ok(Err(failure)) if failure.is_timeout() => {
+            accounting.finish_in_background("timeout", None);
             return error(StatusCode::GATEWAY_TIMEOUT, "Upstream request timed out");
         }
-        Ok(Err(_)) => return error(StatusCode::BAD_GATEWAY, "Upstream request failed"),
-        Err(_) => return error(StatusCode::GATEWAY_TIMEOUT, "Upstream request timed out"),
+        Ok(Err(_)) => {
+            accounting.finish_in_background("upstream_error", None);
+            return error(StatusCode::BAD_GATEWAY, "Upstream request failed");
+        }
+        Err(_) => {
+            accounting.finish_in_background("timeout", None);
+            return error(StatusCode::GATEWAY_TIMEOUT, "Upstream request timed out");
+        }
     };
 
     let status = response.status();
+    let completed = if status.is_success() {
+        "completed"
+    } else {
+        "upstream_error"
+    };
+    let mut usage = UsageTracker::new(response.headers());
     let mut headers = HeaderMap::new();
     for name in [
         header::CONTENT_TYPE,
@@ -61,21 +74,26 @@ pub(super) async fn forward(
     );
 
     let Some(first) = first else {
+        drop(response);
+        accounting.finish_in_background(completed, usage.finish());
         return (status, headers, Body::empty()).into_response();
     };
+    // Account bytes already received even if the downstream disconnects before
+    // the relay task gets its first poll.
+    usage.feed(&first);
+    accounting.observe_usage(usage.observed());
     // One queued chunk plus the producer's current chunk bounds read-ahead.
-    // A separate terminal result cannot be lost when that queue is full.
+    // Accounting retains only a bounded JSON body or a bounded SSE event.
     let (sender, receiver) = mpsc::channel::<Bytes>(1);
     let (finished, terminal) = oneshot::channel();
     tokio::spawn(async move {
-        let result = {
+        let (outcome, result) = {
             let relay = async {
-                let _permit = permit;
                 let mut response = response;
                 sender
                     .send(first)
                     .await
-                    .map_err(|_| io::Error::other("Downstream disconnected"))?;
+                    .map_err(|_| ("disconnected", io::Error::other("Downstream disconnected")))?;
                 loop {
                     let chunk = timeout(idle_timeout, async {
                         loop {
@@ -86,27 +104,51 @@ pub(super) async fn forward(
                         }
                     })
                     .await
-                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Upstream idle timeout"))?
-                    .map_err(|_| io::Error::other("Upstream response failed"))?;
+                    .map_err(|_| {
+                        (
+                            "timeout",
+                            io::Error::new(io::ErrorKind::TimedOut, "Upstream idle timeout"),
+                        )
+                    })?
+                    .map_err(|_| {
+                        (
+                            "upstream_error",
+                            io::Error::other("Upstream response failed"),
+                        )
+                    })?;
                     let Some(chunk) = chunk else { return Ok(()) };
-                    sender
-                        .send(chunk)
-                        .await
-                        .map_err(|_| io::Error::other("Downstream disconnected"))?;
+                    usage.feed(&chunk);
+                    accounting.observe_usage(usage.observed());
+                    sender.send(chunk).await.map_err(|_| {
+                        ("disconnected", io::Error::other("Downstream disconnected"))
+                    })?;
                 }
             };
             // Deadlines keep running even if downstream stops polling. Dropping
             // the body closes the receiver and cancels upstream immediately.
             tokio::select! {
                 biased;
-                _ = sender.closed() => Ok(()),
-                result = timeout_at(overall_deadline, relay) => result.unwrap_or_else(|_| {
-                    Err(io::Error::new(io::ErrorKind::TimedOut, "Overall request timeout"))
-                }),
+                _ = sender.closed() => ("disconnected", Ok(())),
+                result = timeout_at(overall_deadline, relay) => match result {
+                    Ok(Ok(())) => (completed, Ok(())),
+                    Ok(Err((outcome, error))) => (outcome, Err(error)),
+                    Err(_) => ("timeout", Err(io::Error::new(io::ErrorKind::TimedOut, "Overall request timeout"))),
+                },
             }
         };
+        let known = if outcome == completed && result.is_ok() {
+            usage.finish()
+        } else {
+            // A complete cumulative SSE report remains known even if the
+            // connection subsequently fails. Partial JSON never becomes usage.
+            usage.observed()
+        };
+        // Transport completion must not wait for SQLite. The relay future has
+        // already dropped upstream; retain accounting (and its permit) here
+        // until the blocking reconciliation worker finishes.
         drop(sender);
         let _ = finished.send(result);
+        accounting.finish(outcome, known).await;
     });
     let chunks = stream::unfold(
         (receiver, Some(terminal)),

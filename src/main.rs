@@ -13,7 +13,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|_| anyhow::anyhow!("could not load TLS certificate and private key"))?;
     let database_path = config.database_path.clone();
-    let store = tokio::task::spawn_blocking(move || Store::open(&database_path))
+    let store = tokio::task::spawn_blocking(move || Store::open_exclusive(&database_path))
         .await
         .context("database startup task failed")??;
     let listener = TcpListener::bind(config.listen_addr)

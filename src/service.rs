@@ -32,7 +32,9 @@ use crate::{
     store::{InsertError, JobAdmission, JobTransition, NewJob, Store, TransitionError},
 };
 
+mod accounting;
 mod streaming;
+mod usage;
 
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
@@ -200,18 +202,23 @@ async fn admitted_chat(
     let store = state.store.clone();
     // Blocking work outlives a cancelled waiter. Keep its capacity charged until
     // admission actually finishes, then transfer the permit back to the request.
-    let (job, permit) = match tokio::task::spawn_blocking(move || {
+    let (job, mut accounting) = match tokio::task::spawn_blocking(move || {
         let admission = store.admit_job(token_hash);
-        (admission, permit)
+        let accounting = if let Ok(JobAdmission::Admitted(job)) = &admission {
+            Some(accounting::Accounting::new(store, job.request_id, permit))
+        } else {
+            None
+        };
+        (admission, accounting)
     })
     .await
     {
-        Ok((Ok(JobAdmission::Admitted(job)), permit)) => (job, permit),
+        Ok((Ok(JobAdmission::Admitted(job)), Some(accounting))) => (job, accounting),
         Ok((Ok(JobAdmission::Unauthorized), _)) => return unauthorized(),
         Ok((Ok(JobAdmission::Exhausted), _)) => {
             return error(StatusCode::TOO_MANY_REQUESTS, "Request quota exhausted");
         }
-        Ok((Err(_), _)) | Err(_) => {
+        Ok((Err(_), _)) | Ok((Ok(JobAdmission::Admitted(_)), None)) | Err(_) => {
             return error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Could not authenticate job",
@@ -219,10 +226,12 @@ async fn admitted_chat(
         }
     };
     if request.method() != Method::POST || request.uri().path() != "/v1/chat/completions" {
+        accounting.reject().await;
         return error(StatusCode::FORBIDDEN, "Forbidden route");
     }
     let Some(key) = state.config.upstream_keys.get(&job.upstream_key_id) else {
         // A persisted job may reference a key removed from the startup pool.
+        accounting.reject().await;
         return unauthorized();
     };
     let mut url = state.config.upstream_base_url.clone();
@@ -242,6 +251,7 @@ async fn admitted_chat(
             } else {
                 StatusCode::BAD_REQUEST
             };
+            accounting.reject().await;
             return error(status, "Invalid JSON request");
         }
     };
@@ -250,9 +260,11 @@ async fn admitted_chat(
             .get("stream")
             .is_some_and(|stream| !stream.is_boolean())
     {
+        accounting.reject().await;
         return error(StatusCode::BAD_REQUEST, "Chat stream must be a boolean");
     }
     let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        accounting.reject().await;
         return error(StatusCode::BAD_REQUEST, "Chat messages must be an array");
     };
     // Only exact system-content matches are duplicates. Client markers and
@@ -262,12 +274,29 @@ async fn admitted_chat(
             && message.get("content").and_then(Value::as_str) == Some(&job.system_prompt))
     });
     messages.insert(0, json!({"role": "system", "content": job.system_prompt}));
+    if body.get("stream") == Some(&Value::Bool(true)) {
+        let options = body
+            .as_object_mut()
+            .unwrap()
+            .entry("stream_options")
+            .or_insert_with(|| json!({}));
+        let Some(options) = options.as_object_mut() else {
+            accounting.reject().await;
+            return error(
+                StatusCode::BAD_REQUEST,
+                "Chat stream_options must be an object",
+            );
+        };
+        // Ask compatible upstreams for the final cumulative usage report.
+        options.insert("include_usage".to_owned(), Value::Bool(true));
+    }
 
     // Start a fresh request: no client credentials, cookies, routing headers,
     // or hop-by-hop headers cross the upstream trust boundary.
+    accounting.dispatched();
     streaming::forward(
         state.upstream.post(url).bearer_auth(key).json(&body),
-        permit,
+        accounting,
         deadline,
         Duration::from_secs(state.config.first_byte_timeout_seconds),
         Duration::from_secs(state.config.idle_timeout_seconds),
@@ -540,6 +569,27 @@ mod tests {
             .unwrap();
         let body = serde_json::from_slice(&bytes).unwrap();
         (status, headers, body)
+    }
+
+    async fn wait_for_accounting(fixture: &Fixture) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let pending: i64 = Connection::open(&fixture.path)
+                    .unwrap()
+                    .query_row(
+                        "SELECT COUNT(*) FROM request_records WHERE outcome = 'pending'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                if pending == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("durable request accounting did not complete");
     }
 
     async fn issue(app: Router, body: Value) -> (StatusCode, HeaderMap, Value) {
