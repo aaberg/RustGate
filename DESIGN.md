@@ -68,7 +68,7 @@ Order of checks on every proxied request:
   * Request size cap (e.g. 1 MB) — also your cost guard.
   * Secret-scanning heuristic on the serialized body: regexes for common key shapes (sk-…, the upstream key prefix pattern, long high-entropy base64 runs). A match → block with 403 and log block_reason=possible_secret. Rationale: an agent that found a secret somewhere must not be able to send it through the proxy either. Cheap, deterministic, high value.
   * Prompt-injection marker scan (best-effort, advisory only — log a flag, don't block by default): phrases like "reveal your system prompt", "print your environment", "include the API key". This is a tripwire, not a wall: it feeds the audit trail and the per-tenant risk score, and can be escalated to blocking later once you know your false-positive rate.
-* System prompt injection (step 5): inject the persisted authoritative `system_prompt` as the first system message using a deterministic content-based rule; preserve permitted client messages after it. Never trust a client-supplied sentinel or header as proof that the authoritative prompt is present. The builder supplies the prompt at issuance; a container cannot replace the persisted prompt.
+* System prompt injection (step 5): prepend a fresh system message containing the persisted authoritative `system_prompt` verbatim. Remove every client message whose `role` is exactly `"system"` and whose string `content` exactly equals that prompt; preserve all other messages in order. Never trust a client-supplied sentinel, name, or header as proof that the authoritative prompt is present. The builder supplies the prompt at issuance; a container cannot replace the persisted prompt.
 
 * Upstream key pool
 
@@ -95,7 +95,7 @@ Order of checks on every proxied request:
 
 ## Configuration (env or file)
 
-* Listen addr + TLS cert paths; upstream base URL; path allowlist; default/max TTL, request cap, token cap; secret-scan regex list; system-prompt sentinel string; secrets source for the key pool; SQLite path.
+* Listen addr + TLS cert paths; upstream base URL; path allowlist; default/max TTL, request cap, token cap; secret-scan regex list; secrets source for the key pool; SQLite path. Prompt injection uses the persisted job prompt, not a configurable sentinel.
 
 ## Testing requirements (give these to the agent as acceptance criteria)
 
@@ -103,13 +103,13 @@ Order of checks on every proxied request:
  * Hold an admitted upstream call open, revoke the job, and verify the held call completes while subsequent requests immediately fail. Apply the same admission boundary to done and expiry.
  * Quota exhaustion: request cap and token cap both enforced under concurrency (spawn parallel requests; assert the cap holds).
  * Secret-scan: a request body containing a fake sk- key is blocked; a benign body is not.
- * System-prompt injection: request without the operator system message gets it prepended; with it, no duplicate.
+ * System-prompt injection: absent, spoofed, already-present, and duplicated operator messages produce exactly one authoritative system-content match at index zero. Preserve other messages, metadata, and chat fields; exercise verbatim whitespace/Unicode, non-system matches, malformed message arrays, job isolation, and restart.
  * Streaming: SSE response streams incrementally end-to-end.
  * Path allowlist rejects /v1/admin style paths.
 
-## Implemented service: steps 1 through 4
+## Implemented service: steps 1 through 5
 
-The service implements HTTPS, configuration, health, graceful shutdown, authenticated job issuance, SQLite persistence, job-authenticated non-streaming chat proxying, and durable expiry/revoke/done transitions. The separate mock remains a loopback-only HTTP fixture. Prompt injection, quota enforcement, streaming, and full resource bounds are **not implemented yet**; persisted caps are issuance metadata until their roadmap increments. Do not connect real build containers yet.
+The service implements HTTPS, configuration, health, graceful shutdown, authenticated job issuance, SQLite persistence, job-authenticated non-streaming chat proxying, durable expiry/revoke/done transitions, and authoritative prompt injection. The separate mock remains a loopback-only HTTP fixture. Quota enforcement, streaming, and full resource bounds are **not implemented yet**; persisted caps are issuance metadata until their roadmap increments. Do not connect real build containers yet.
 
 ### Running
 
@@ -210,7 +210,7 @@ Revoke persists `status = revoked` and the UTC epoch-second `revoked_at`. Done p
 
 Expiry is effective when `expires_at <= now`, using UTC epoch seconds sampled after obtaining the SQLite transaction lock. Startup persists `expired` for every overdue active job. During service operation, admission and lifecycle operations materialize expiry for the job they access; there is no background expiry sweep. An untouched overdue row can therefore still read `active` directly from SQLite until access or restart, but its token cannot admit a new call. An overdue active job becomes `expired` before a revoke/done attempt, which returns `409`.
 
-Admission and lifecycle transitions serialize in SQLite Immediate transactions, including across independently opened store connections. Admission commits the eligible-key lookup before reading the request body or contacting upstream. A request admitted before revoke, done, or expiry continues without rechecking status, even if its body or upstream response is still pending. Once a transition completes, subsequent admission fails with `401`. Terminal state and revocation metadata survive restart; an unexpired active job's original token continues to work.
+Admission and lifecycle transitions serialize in SQLite Immediate transactions, including across independently opened store connections. Admission commits a snapshot of the eligible job's key ID and authoritative prompt before reading the request body or contacting upstream. A request admitted before revoke, done, or expiry continues using that snapshot without rechecking status, even if its body or upstream response is still pending. Once a transition completes, subsequent admission fails with `401`. Terminal state and revocation metadata survive restart; an unexpired active job's original token continues to work.
 
 ### Proxying a chat request
 
@@ -233,7 +233,13 @@ Admission hashes the bearer and looks up the persisted job on every request, req
 
 After authentication, the fixed allowlist permits only exact `POST /v1/chat/completions`. Other methods and paths receive `403`, including trailing slashes, encoded alternatives, embeddings, models, and admin paths. The separate health, issuance, and lifecycle routes retain their own contracts. Authentication and route checks precede body reads.
 
-The body must be a JSON object with a JSON content type and at most 1 MiB, including unknown-length/chunked bodies. `stream` must be omitted or literal `false`; streaming, invalid JSON, non-object bodies, and invalid content types receive `400`, while oversized bodies receive `413`. Provider-specific chat fields are left to upstream validation. JSON is parsed and reserialized before forwarding so duplicate keys cannot give the proxy and upstream different interpretations. No authoritative prompt is injected until step 5.
+The body must be a JSON object with a JSON content type and at most 1 MiB, including unknown-length/chunked bodies. `messages` must be an array (an empty array is permitted); missing or non-array values receive `400`. `stream` must be omitted or literal `false`; streaming, invalid JSON, non-object bodies, and invalid content types receive `400`, while oversized bodies receive `413`. Message-entry schemas and other provider-specific chat fields are left to upstream validation. JSON is parsed and reserialized before forwarding so duplicate keys cannot give the proxy and upstream different interpretations.
+
+For supported chat requests, prompt injection removes all messages whose `role` is exactly `"system"` and whose string `content` equals the stored prompt, then prepends a new `{"role":"system","content":<stored prompt>}` message. This yields exactly one authoritative system-content match, at index zero, even if the client supplied several copies or placed them later in the conversation. Duplicate messages' client metadata is discarded; it is not attached to the authoritative message.
+
+Equality is exact on decoded strings: no trimming, case folding, Unicode normalization, sentinel detection, or conversion of content-part arrays. The stored prompt is injected verbatim, including whitespace and Unicode. Other system messages, developer/user/assistant/tool messages, structured content, and all their fields retain their order and values; all other top-level chat fields remain unchanged. Names, sentinels, and headers never suppress injection. This guarantees payload placement, not model obedience or resistance to instructions in preserved client messages.
+
+The 1 MiB cap applies to the incoming body before injection; the transformed upstream body may be larger. The local mock has its own independent 1 MiB request limit and can therefore reject a transformed near-limit request with `413`. No prompt transformation is applied to health, issuance, or lifecycle requests; embeddings and model listing remain forbidden until step 11.
 
 The configured upstream base path is a prefix: `https://host/gateway/` targets `/gateway/v1/chat/completions`. The admitted request's query is preserved, but its host and path cannot select another destination. A fresh upstream request contains the selected key as bearer authorization and JSON content type, without forwarding client authorization, cookies, proxy credentials, or arbitrary client headers. Redirects and automatic retries are disabled, as are environment-selected HTTP proxies.
 

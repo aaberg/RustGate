@@ -27,6 +27,12 @@ pub(crate) struct NewJob {
     pub max_tokens_total: i64,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct AdmittedJob {
+    pub upstream_key_id: String,
+    pub system_prompt: String,
+}
+
 pub(crate) enum InsertError {
     DuplicateJob,
     Storage,
@@ -167,7 +173,7 @@ impl Store {
 
     /// Commits admission on a blocking worker, materializing expiry before lookup.
     /// Admitted requests do not recheck state while their upstream call is running.
-    pub(crate) fn active_job_key(&self, token_hash: [u8; 32]) -> Result<Option<String>> {
+    pub(crate) fn admit_job(&self, token_hash: [u8; 32]) -> Result<Option<AdmittedJob>> {
         let mut connection = self
             .connection
             .lock()
@@ -175,11 +181,11 @@ impl Store {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("could not begin job admission")?;
-        let key = active_job_key_in_transaction(&transaction, token_hash, epoch_seconds()?)?;
+        let job = admit_job_in_transaction(&transaction, token_hash, epoch_seconds()?)?;
         transaction
             .commit()
             .context("could not commit job admission")?;
-        Ok(key)
+        Ok(job)
     }
 
     /// Materializes expiry before applying a terminal transition. The first
@@ -245,11 +251,11 @@ fn epoch_seconds() -> Result<i64> {
     i64::try_from(seconds).context("system clock exceeds the supported range")
 }
 
-fn active_job_key_in_transaction(
+fn admit_job_in_transaction(
     transaction: &rusqlite::Transaction<'_>,
     token_hash: [u8; 32],
     now: i64,
-) -> Result<Option<String>> {
+) -> Result<Option<AdmittedJob>> {
     transaction
         .execute(
             "UPDATE jobs SET status = 'expired'
@@ -259,10 +265,15 @@ fn active_job_key_in_transaction(
         .context("could not expire job during admission")?;
     transaction
         .query_row(
-            "SELECT upstream_key_id FROM jobs
+            "SELECT upstream_key_id, system_prompt FROM jobs
              WHERE token_hash = ?1 AND status = 'active' AND expires_at > ?2",
             params![token_hash.as_slice(), now],
-            |row| row.get(0),
+            |row| {
+                Ok(AdmittedJob {
+                    upstream_key_id: row.get(0)?,
+                    system_prompt: row.get(1)?,
+                })
+            },
         )
         .optional()
         .context("could not look up job")
@@ -314,16 +325,19 @@ mod tests {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .unwrap();
         assert_eq!(
-            active_job_key_in_transaction(&transaction, [1; 32], 1_000).unwrap(),
+            admit_job_in_transaction(&transaction, [1; 32], 1_000).unwrap(),
             None
         );
         assert_eq!(
-            active_job_key_in_transaction(&transaction, [2; 32], 1_000).unwrap(),
+            admit_job_in_transaction(&transaction, [2; 32], 1_000).unwrap(),
             None
         );
         assert_eq!(
-            active_job_key_in_transaction(&transaction, [3; 32], 1_000).unwrap(),
-            Some("upstream".to_owned())
+            admit_job_in_transaction(&transaction, [3; 32], 1_000).unwrap(),
+            Some(AdmittedJob {
+                upstream_key_id: "upstream".to_owned(),
+                system_prompt: "system".to_owned(),
+            })
         );
         transaction.commit().unwrap();
         drop(connection);
@@ -343,11 +357,14 @@ mod tests {
         insert_job(&store, "unrelated", 2, 2);
         insert_job(&store, "future", 3, i64::MAX);
 
-        assert_eq!(store.active_job_key([1; 32]).unwrap(), None);
-        assert_eq!(store.active_job_key([9; 32]).unwrap(), None);
+        assert_eq!(store.admit_job([1; 32]).unwrap(), None);
+        assert_eq!(store.admit_job([9; 32]).unwrap(), None);
         assert_eq!(
-            store.active_job_key([3; 32]).unwrap(),
-            Some("upstream".to_owned())
+            store.admit_job([3; 32]).unwrap(),
+            Some(AdmittedJob {
+                upstream_key_id: "upstream".to_owned(),
+                system_prompt: "system".to_owned(),
+            })
         );
 
         let observer = Connection::open(&path).unwrap();
@@ -359,7 +376,7 @@ mod tests {
         assert_eq!(job_state(&observer, "future").0, "active");
         drop(store);
         let reopened = Store::open(&path).unwrap();
-        assert_eq!(reopened.active_job_key([1; 32]).unwrap(), None);
+        assert_eq!(reopened.admit_job([1; 32]).unwrap(), None);
         assert_eq!(job_state(&observer, "overdue").0, "expired");
     }
 
@@ -450,7 +467,7 @@ mod tests {
                 store.transition_job(job_id, other_transition),
                 Err(TransitionError::Conflict)
             );
-            assert_eq!(store.active_job_key([token; 32]).unwrap(), None);
+            assert_eq!(store.admit_job([token; 32]).unwrap(), None);
             assert_eq!(job_state(&observer, job_id), snapshot);
             snapshots.push((job_id, snapshot));
         }
@@ -606,7 +623,7 @@ mod tests {
                 JobTransition::Done => "done",
             };
             assert_eq!(job_state(&observer, job_id).0, status);
-            assert_eq!(first.active_job_key([token; 32]).unwrap(), None);
+            assert_eq!(first.admit_job([token; 32]).unwrap(), None);
             assert_eq!(second.transition_job(job_id, winner), Ok(()));
         }
     }

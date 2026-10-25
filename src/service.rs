@@ -160,8 +160,8 @@ async fn proxy_chat(State(state): State<Arc<ServiceState>>, request: Request) ->
     };
     let token_hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
     let store = state.store.clone();
-    let key_id = match tokio::task::spawn_blocking(move || store.active_job_key(token_hash)).await {
-        Ok(Ok(Some(key_id))) => key_id,
+    let job = match tokio::task::spawn_blocking(move || store.admit_job(token_hash)).await {
+        Ok(Ok(Some(job))) => job,
         Ok(Ok(None)) => return unauthorized(),
         Ok(Err(_)) | Err(_) => {
             return error(
@@ -173,7 +173,7 @@ async fn proxy_chat(State(state): State<Arc<ServiceState>>, request: Request) ->
     if request.method() != Method::POST || request.uri().path() != "/v1/chat/completions" {
         return error(StatusCode::FORBIDDEN, "Forbidden route");
     }
-    let Some(key) = state.config.upstream_keys.get(&key_id) else {
+    let Some(key) = state.config.upstream_keys.get(&job.upstream_key_id) else {
         // A persisted job may reference a key removed from the startup pool.
         return unauthorized();
     };
@@ -186,7 +186,7 @@ async fn proxy_chat(State(state): State<Arc<ServiceState>>, request: Request) ->
 
     // Authentication and route checks precede body reads. Reserialization gives
     // the proxy and upstream identical JSON semantics, including duplicate keys.
-    let body = match Json::<Value>::from_request(request, &state).await {
+    let mut body = match Json::<Value>::from_request(request, &state).await {
         Ok(Json(body)) => body,
         Err(rejection) => {
             let status = if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
@@ -207,6 +207,16 @@ async fn proxy_chat(State(state): State<Arc<ServiceState>>, request: Request) ->
             "Only non-streaming chat is supported",
         );
     }
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return error(StatusCode::BAD_REQUEST, "Chat messages must be an array");
+    };
+    // Only exact system-content matches are duplicates. Client markers and
+    // metadata cannot stand in for the persisted operator prompt.
+    messages.retain(|message| {
+        !(message.get("role").and_then(Value::as_str) == Some("system")
+            && message.get("content").and_then(Value::as_str) == Some(&job.system_prompt))
+    });
+    messages.insert(0, json!({"role": "system", "content": job.system_prompt}));
 
     // Start a fresh request: no client credentials, cookies, routing headers,
     // or hop-by-hop headers cross the upstream trust boundary.
