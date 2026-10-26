@@ -1323,3 +1323,38 @@ async fn every_requested_choice_must_afford_at_least_one_output_token() {
     assert_eq!(token_balances(&fixture), (0, 0, 0));
     assert_eq!(persisted(&fixture.path)["requests_used"], 2);
 }
+
+#[tokio::test]
+async fn migrated_overspent_jobs_are_permanently_denied_on_the_first_attempt() {
+    let mock = crate::mock::router();
+    let (mut fixture, upstream) = fixture(mock.clone(), "").await;
+    let token = token(&fixture).await;
+    let observer = Connection::open(&fixture.path).unwrap();
+    // Version 2 could retain active jobs already at or beyond their token cap.
+    observer
+        .execute_batch(
+            "UPDATE jobs SET tokens_used = max_tokens_total, requests_used = 7;
+         ALTER TABLE jobs DROP COLUMN tokens_unreported;
+         PRAGMA user_version = 2;",
+        )
+        .unwrap();
+    let mut settings = config(fixture.path.clone());
+    settings.upstream_base_url = format!("http://{}", upstream.address).parse().unwrap();
+    fixture.app = router(settings, Store::open(&fixture.path).unwrap()).unwrap();
+    for _ in 0..2 {
+        let (status, headers, body) =
+            bounded_send(fixture.app.clone(), chat(unread_body(), Some(&token))).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(!headers.contains_key(header::RETRY_AFTER));
+        assert!(!headers.contains_key(header::WWW_AUTHENTICATE));
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        assert_private_error(&body);
+        assert_eq!(persisted(&fixture.path)["status"], "exhausted");
+        assert_eq!(persisted(&fixture.path)["requests_used"], 7);
+    }
+    let records: i64 = observer
+        .query_row("SELECT count(*) FROM request_records", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(records, 0);
+    assert_eq!(captures(mock).await, json!([]));
+}
