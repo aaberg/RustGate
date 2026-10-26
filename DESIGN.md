@@ -66,8 +66,8 @@ Order of checks on every proxied request:
 * Path allowlist: only the configured upstream endpoints are forwardable (/v1/chat/completions, /v1/embeddings, /v1/models). Anything else → 403. This prevents a jailbroken agent from using admin endpoints or other products under the same upstream account.
 * Body policy checks (fast, local, no LLM):
   * Request size cap (e.g. 1 MB) — also your cost guard.
-  * Secret-scanning heuristic on the serialized body: regexes for common key shapes (sk-…, the upstream key prefix pattern, long high-entropy base64 runs). A match → block with 403 and log block_reason=possible_secret. Rationale: an agent that found a secret somewhere must not be able to send it through the proxy either. Cheap, deterministic, high value.
-  * Prompt-injection marker scan (best-effort, advisory only — log a flag, don't block by default): phrases like "reveal your system prompt", "print your environment", "include the API key". This is a tripwire, not a wall: it feeds the audit trail and the per-tenant risk score, and can be escalated to blocking later once you know your false-positive rate.
+  * Configurable local regex heuristics scan canonical serialized client JSON and decoded string values/object keys, including metadata. Default patterns flag common `sk-` key shapes and long base64-like runs; they do not prove entropy or cover every secret. A match blocks with `403` and persists only `block_reason = possible_secret`, never the matching text or regex. JSON escapes cannot hide matching decoded text.
+  * Prompt-injection marker scan is advisory only: default case-insensitive patterns flag "reveal your system prompt", "print your environment", and "include the API key". Persist a boolean flag, never block solely for this match. This is a tripwire, not a wall; risk scoring and escalation remain deferred.
 * System prompt injection (step 5): prepend a fresh system message containing the persisted authoritative `system_prompt` verbatim. Remove every client message whose `role` is exactly `"system"` and whose string `content` exactly equals that prompt; preserve all other messages in order. Never trust a client-supplied sentinel, name, or header as proof that the authoritative prompt is present. The builder supplies the prompt at issuance; a container cannot replace the persisted prompt.
 
 * Upstream key pool
@@ -107,9 +107,9 @@ Order of checks on every proxied request:
  * Streaming: SSE response streams incrementally end-to-end.
  * Path allowlist rejects /v1/admin style paths.
 
-## Implemented service: steps 1 through 9
+## Implemented service: steps 1 through 10
 
-The service implements HTTPS, configuration, health, graceful shutdown, authenticated job issuance, SQLite persistence, job-authenticated chat proxying with incremental SSE responses, durable expiry/revoke/done transitions, authoritative prompt injection, concurrent request and token quotas, bounded concurrency/timeouts, and durable usage accounting. The separate mock remains a loopback-only HTTP fixture. Token-budget enforcement supports text-only chat against a trusted compatible upstream; its tokenizer and generation-limit requirements are specified below. Body-policy scanning, other endpoints, and operational readiness remain later increments.
+The service implements HTTPS, configuration, health, graceful shutdown, authenticated job issuance, SQLite persistence, job-authenticated chat proxying with incremental SSE responses, durable expiry/revoke/done transitions, authoritative prompt injection, concurrent request and token quotas, bounded concurrency/timeouts, durable usage accounting, and local body-policy checks with redacted audit decisions. The separate mock remains a loopback-only HTTP fixture. Token-budget enforcement supports text-only chat against a trusted compatible upstream; its tokenizer and completion-cap assumptions are explicit below.
 
 ### Running
 
@@ -159,6 +159,8 @@ Precedence: built-in defaults, optional TOML file selected by `RUSTGATE_CONFIG`,
 | `idle_timeout_seconds` | `120`; wait for the next nonempty upstream body chunk or EOF |
 | `overall_timeout_seconds` | `600`; admission, incoming body read, dispatch, and response relay |
 | `max_in_flight_requests` | `64`; per process, accepted range 1–65536 |
+| `secret_scan_patterns` | Regex string array; defaults detect common `sk-` keys and long base64-like runs |
+| `prompt_injection_patterns` | Regex string array; default case-insensitive advisory phrases described below |
 
 Defaults must be positive and not exceed their maxima; all maxima must fit a signed SQLite integer. Upstream URLs cannot include credentials, query strings, or fragments. Key credentials must be nonempty visible ASCII without whitespace. Mount secret configuration read-only with restrictive permissions, or supply environment variables; neither key-pool credentials nor the control credential are persisted in SQLite. Keys are loaded at startup; restart to change the pool.
 
@@ -256,6 +258,20 @@ The configured upstream base path is a prefix: `https://host/gateway/` targets `
 
 Responses are forwarded incrementally, whether SSE, ordinary JSON, or an upstream error. Upstream status and body pass through, along with `Content-Type`, `Content-Encoding`, and `Retry-After` when present; other upstream headers, including redirects' `Location` and cookies, are not forwarded. Compressed bodies are not decompressed by the proxy: all `Content-Encoding` values are preserved in order so clients can decode the unchanged bytes. Proxy responses use `Cache-Control: no-store`. Upstream failures are never retried; the client decides whether to retry. Known usage and unknown-budget charges are reconciled as described below.
 
+### Body policy and redacted audit
+
+After admission, route/key checks, bounded JSON parsing, and object/stream validation, RustGate scans the original client JSON before prompt transformation, token-reservation narrowing, or upstream dispatch. Scans include metadata and object keys, not just chat messages. Both canonical serialized JSON and decoded strings are inspected: JSON escape sequences cannot hide a secret; duplicate keys use the same last-value semantics as the forwarded JSON. The trusted stored operator prompt is not scanned unless the client includes it in its own body. Issuance, lifecycle, and health routes are outside this policy.
+
+A secret match returns generic JSON `403` with `Cache-Control: no-store`. The admitted attempt remains charged, while its token reservation is released as known zero upstream usage. An advisory match alone does not block or alter client messages. The service persists the scan decision before forwarding; audit persistence failure fails closed with generic `500`. Blocking SQLite audit work retains the in-flight permit through cancellation, like admission and reservation work.
+
+Schema version 4 adds `request_records.policy_verdict` (`allowed` / `blocked`, or `NULL` if not scanned), `block_reason` (`possible_secret` only, otherwise `NULL`), and `prompt_injection` (boolean integer). A blocked body can also have the advisory flag. Decisions are immutable and survive finalization/restart; legacy records remain unscanned. `allowed` means the scan found no configured secret pattern, not that later chat/budget validation or upstream processing succeeded. No bodies, matching excerpts, pattern text, or credentials enter these fields or service logs. The already-persisted authoritative job prompt remains sensitive; protect SQLite and backups.
+
+`secret_scan_patterns` and `prompt_injection_patterns` replace their respective defaults; an explicit empty array disables that scan. TOML values are string arrays; `RUSTGATE_SECRET_SCAN_PATTERNS` and `RUSTGATE_PROMPT_INJECTION_PATTERNS` accept JSON string arrays. Regexes compile once during router startup, and malformed or over-limit configurations fail startup without echoing their values. Use Rust `regex` syntax, including inline flags such as `(?i)` for case-insensitive custom patterns. Restart to apply changes. Defaults are heuristics: benign encoded data can match, and secrets outside configured shapes can pass. Add provider-specific patterns for the deployed key formats; do not treat this scanner as a complete exfiltration boundary.
+
+Default secret regexes are `sk-[A-Za-z0-9_-]{20,}` and `[A-Za-z0-9+/]{48,}[0-9+/][A-Za-z0-9+/]{48,}={0,2}`. The latter requires at least 97 base64-alphabet characters with a digit, `+`, or `/` at least 48 characters from either end; it is not an entropy calculation. Advisory defaults are case-insensitive and allow whitespace between the words in the three phrases above. Each pattern searches the serialized body and individual decoded strings/keys independently; separate string values are never concatenated.
+
+Each list permits at most 64 patterns, 4096 bytes per pattern, and 65536 aggregate pattern bytes. Each compiled set has a 1 MiB compiled-size limit, 1 MiB DFA cache limit, and nesting limit 64. These bounds supplement the existing 1 MiB client-body cap.
+
 ### Streaming and resource bounds
 
 ```sh
@@ -304,7 +320,7 @@ Supported messages are objects with absent/null/string content or arrays of `{"t
 
 ### Token usage accounting and recovery
 
-Schema version 3 preserves existing jobs, known usage, and request records, and adds `jobs.tokens_unreported` alongside `jobs.tokens_reserved`. Legacy requests are not reconstructed; pre-enforcement unknown usage with zero-sized reservations cannot be retroactively priced. Each admitted attempt has a durable integer `request_id`, job ID, admission/finish epoch-second timestamps, terminal outcome, reservation amount, and nullable prompt/completion/total token counts. Bodies, prompts, bearer tokens, and upstream credentials are not copied into these records.
+Schema version 3 introduced `jobs.tokens_unreported` alongside `jobs.tokens_reserved`; version 4 preserves this accounting while adding the redacted policy fields described above. Legacy requests are not reconstructed; pre-enforcement unknown usage with zero-sized reservations cannot be retroactively priced. Each admitted attempt has a durable integer `request_id`, job ID, admission/finish epoch-second timestamps, terminal outcome, reservation amount, and nullable prompt/completion/total token counts. Bodies, prompts, bearer tokens, and upstream credentials are not copied into these records.
 
 For `"stream": true`, RustGate sets `stream_options.include_usage = true`, overriding client `false` while preserving other option fields. Omitted options become an object; a supplied non-object receives `400` after admission. This requests the final cumulative usage chunk from compatible providers; it does not guarantee that they return usage.
 

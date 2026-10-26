@@ -33,6 +33,8 @@ pub struct Config {
     pub idle_timeout_seconds: u64,
     pub overall_timeout_seconds: u64,
     pub max_in_flight_requests: u64,
+    pub secret_scan_patterns: Vec<String>,
+    pub prompt_injection_patterns: Vec<String>,
 }
 
 impl fmt::Debug for Config {
@@ -63,6 +65,8 @@ struct FileConfig {
     idle_timeout_seconds: Option<u64>,
     overall_timeout_seconds: Option<u64>,
     max_in_flight_requests: Option<u64>,
+    secret_scan_patterns: Option<Vec<String>>,
+    prompt_injection_patterns: Option<Vec<String>>,
 }
 
 impl Config {
@@ -71,6 +75,25 @@ impl Config {
             |name| std::env::var_os(name),
             |path| std::fs::read_to_string(path),
         )
+    }
+
+    // Lists replace defaults wholesale; an empty list disables that scanner.
+    // The long-run heuristic requires at least 97 base64-alphabet bytes and a
+    // digit, '+' or '/' with at least 48 such bytes on either side. It does not
+    // measure entropy and can match benign encoded data.
+    pub(crate) fn default_secret_scan_patterns() -> Vec<String> {
+        vec![
+            r"sk-[A-Za-z0-9_-]{20,}".to_owned(),
+            r"[A-Za-z0-9+/]{48,}[0-9+/][A-Za-z0-9+/]{48,}={0,2}".to_owned(),
+        ]
+    }
+
+    pub(crate) fn default_prompt_injection_patterns() -> Vec<String> {
+        vec![
+            r"(?i)reveal\s+your\s+system\s+prompt".to_owned(),
+            r"(?i)print\s+your\s+environment".to_owned(),
+            r"(?i)include\s+the\s+API\s+key".to_owned(),
+        ]
     }
 }
 
@@ -88,6 +111,18 @@ fn required(value: Option<String>, name: &str) -> Result<String> {
     value
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| anyhow!("missing or blank {name}"))
+}
+
+pub(crate) fn validate_policy_patterns(patterns: &[String], field: &'static str) -> Result<()> {
+    if patterns.len() > 64
+        || patterns.iter().any(|pattern| pattern.len() > 4096)
+        || patterns.iter().map(String::len).sum::<usize>() > 65536
+    {
+        bail!(
+            "invalid {field}: at most 64 patterns, 4096 bytes per pattern, and 65536 total bytes are allowed"
+        );
+    }
+    Ok(())
 }
 
 fn load_with(
@@ -145,6 +180,21 @@ fn load_with(
         settings.upstream_keys = Some(serde_json::from_str(&value).map_err(|_| {
             anyhow!("invalid upstream_keys: expected a JSON object of string credentials")
         })?);
+    }
+    for (field, destination) in [
+        ("secret_scan_patterns", &mut settings.secret_scan_patterns),
+        (
+            "prompt_injection_patterns",
+            &mut settings.prompt_injection_patterns,
+        ),
+    ] {
+        let name = format!("RUSTGATE_{}", field.to_ascii_uppercase());
+        if let Some(value) = env_value(&mut env, &name)? {
+            *destination =
+                Some(serde_json::from_str::<Vec<String>>(&value).map_err(|_| {
+                    anyhow!("invalid {field}: expected a JSON array of regex strings")
+                })?);
+        }
     }
     let listen_addr = settings
         .listen_addr
@@ -246,6 +296,14 @@ fn load_with(
     if !(1..=65536).contains(&max_in_flight_requests) {
         bail!("invalid max_in_flight_requests: expected 1..=65536");
     }
+    let secret_scan_patterns = settings
+        .secret_scan_patterns
+        .unwrap_or_else(Config::default_secret_scan_patterns);
+    let prompt_injection_patterns = settings
+        .prompt_injection_patterns
+        .unwrap_or_else(Config::default_prompt_injection_patterns);
+    validate_policy_patterns(&secret_scan_patterns, "secret_scan_patterns")?;
+    validate_policy_patterns(&prompt_injection_patterns, "prompt_injection_patterns")?;
     Ok(Config {
         listen_addr,
         upstream_base_url,
@@ -266,6 +324,8 @@ fn load_with(
         idle_timeout_seconds,
         overall_timeout_seconds,
         max_in_flight_requests,
+        secret_scan_patterns,
+        prompt_injection_patterns,
     })
 }
 
@@ -586,6 +646,113 @@ primary = "provider-credential"
             let message = format!("{error:#}");
             assert!(message.contains("configuration file"));
             assert!(!message.contains("secret"));
+        }
+    }
+
+    #[test]
+    fn policy_defaults_are_enabled_and_debug_stays_redacted() {
+        let config = secured(&[], None).unwrap();
+        assert_eq!(
+            config.secret_scan_patterns,
+            Config::default_secret_scan_patterns()
+        );
+        assert_eq!(
+            config.prompt_injection_patterns,
+            Config::default_prompt_injection_patterns()
+        );
+        let config = secured(
+            &[
+                (
+                    "RUSTGATE_SECRET_SCAN_PATTERNS",
+                    r#"["private-regex-value"]"#,
+                ),
+                (
+                    "RUSTGATE_PROMPT_INJECTION_PATTERNS",
+                    r#"["private-advisory-value"]"#,
+                ),
+            ],
+            None,
+        )
+        .unwrap();
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("private-regex-value"));
+        assert!(!debug.contains("private-advisory-value"));
+    }
+
+    #[test]
+    fn policy_arrays_replace_defaults_and_environment_replaces_file() {
+        let file =
+            "secret_scan_patterns = ['file-secret']\nprompt_injection_patterns = ['file-advisory']";
+        let config = secured(&[("RUSTGATE_CONFIG", "settings.toml")], Some(file)).unwrap();
+        assert_eq!(config.secret_scan_patterns, ["file-secret"]);
+        assert_eq!(config.prompt_injection_patterns, ["file-advisory"]);
+
+        let config = secured(
+            &[
+                ("RUSTGATE_CONFIG", "settings.toml"),
+                ("RUSTGATE_SECRET_SCAN_PATTERNS", "[]"),
+                (
+                    "RUSTGATE_PROMPT_INJECTION_PATTERNS",
+                    r#"["env-advisory", "second-advisory"]"#,
+                ),
+            ],
+            Some(file),
+        )
+        .unwrap();
+        assert!(config.secret_scan_patterns.is_empty());
+        assert_eq!(
+            config.prompt_injection_patterns,
+            ["env-advisory", "second-advisory"]
+        );
+        let config = secured(
+            &[("RUSTGATE_CONFIG", "settings.toml")],
+            Some("secret_scan_patterns = []\nprompt_injection_patterns = []"),
+        )
+        .unwrap();
+        assert!(config.secret_scan_patterns.is_empty());
+        assert!(config.prompt_injection_patterns.is_empty());
+    }
+
+    #[test]
+    fn malformed_policy_arrays_fail_without_echoing_supplied_values() {
+        for field in ["secret_scan_patterns", "prompt_injection_patterns"] {
+            let name = format!("RUSTGATE_{}", field.to_ascii_uppercase());
+            for value in [
+                "private-config-value",
+                r#"{"private-config-value":"regex"}"#,
+                r#"["private-config-value", 7]"#,
+                r#""private-config-value""#,
+            ] {
+                let error = secured(&[(&name, value)], None).unwrap_err();
+                let message = format!("{error:#}");
+                assert!(message.contains(field));
+                assert!(!message.contains("private-config-value"));
+            }
+            let file = format!("{field} = ['private-config-value', 7]");
+            let error = secured(&[("RUSTGATE_CONFIG", "settings.toml")], Some(&file)).unwrap_err();
+            assert!(!format!("{error:#}").contains("private-config-value"));
+        }
+    }
+
+    #[test]
+    fn policy_array_size_limits_apply_without_echoing_patterns() {
+        for field in ["secret_scan_patterns", "prompt_injection_patterns"] {
+            let name = format!("RUSTGATE_{}", field.to_ascii_uppercase());
+            for patterns in [
+                vec!["private-config-value".to_owned(); 65],
+                vec!["private-config-value".repeat(300)],
+                vec!["private-config-value".repeat(200); 17],
+            ] {
+                let value = serde_json::to_string(&patterns).unwrap();
+                let error = secured(&[(&name, &value)], None).unwrap_err();
+                let message = format!("{error:#}");
+                assert!(message.contains(field));
+                assert!(!message.contains("private-config-value"));
+                let file = format!("{field} = {value}");
+                let error =
+                    secured(&[("RUSTGATE_CONFIG", "settings.toml")], Some(&file)).unwrap_err();
+                assert!(!format!("{error:#}").contains("private-config-value"));
+            }
         }
     }
 

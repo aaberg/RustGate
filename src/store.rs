@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 #[derive(Clone)]
 pub struct Store {
@@ -212,6 +212,22 @@ impl Store {
                 )
                 .context("could not migrate token budget accounting schema")?;
         }
+        if version <= 3 {
+            transaction
+                .execute_batch(
+                    "ALTER TABLE request_records ADD COLUMN policy_verdict TEXT
+                        CHECK(policy_verdict IN ('allowed', 'blocked'));
+                     ALTER TABLE request_records ADD COLUMN block_reason TEXT
+                        CHECK((policy_verdict IS NULL AND block_reason IS NULL)
+                            OR (policy_verdict IS 'allowed' AND block_reason IS NULL)
+                            OR (policy_verdict IS 'blocked' AND block_reason IS 'possible_secret'));
+                     ALTER TABLE request_records ADD COLUMN prompt_injection INTEGER NOT NULL DEFAULT 0
+                        CHECK(typeof(prompt_injection) = 'integer' AND prompt_injection IN (0, 1)
+                            AND (policy_verdict IS NOT NULL OR prompt_injection = 0));
+                     PRAGMA user_version = 4;",
+                )
+                .context("could not migrate body policy audit schema")?;
+        }
         let now = epoch_seconds()?;
         let pending = {
             let mut statement = transaction
@@ -300,6 +316,35 @@ impl Store {
             .commit()
             .context("could not commit job admission")?;
         Ok(job)
+    }
+
+    /// Records a single body-policy decision using only fixed, redacted audit values.
+    /// The blocking caller must retain its Accounting owner until this returns.
+    pub(crate) fn record_body_policy(
+        &self,
+        request_id: i64,
+        blocked: bool,
+        prompt_injection: bool,
+    ) -> Result<()> {
+        let connection = self
+            .inner
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock failed"))?;
+        let verdict = if blocked { "blocked" } else { "allowed" };
+        let reason = blocked.then_some("possible_secret");
+        let updated = connection
+            .execute(
+                "UPDATE request_records
+                 SET policy_verdict = ?2, block_reason = ?3, prompt_injection = ?4
+                 WHERE request_id = ?1 AND outcome = 'pending' AND policy_verdict IS NULL",
+                params![request_id, verdict, reason, prompt_injection],
+            )
+            .context("could not record body policy decision")?;
+        if updated != 1 {
+            bail!("body policy requires a pending, unscanned request");
+        }
+        Ok(())
     }
 
     /// Shrinks an admitted request's escrow without rechecking the job lifecycle.
@@ -1557,6 +1602,283 @@ mod tests {
             .unwrap()
     }
 
+    fn policy_state(
+        connection: &Connection,
+        request_id: i64,
+    ) -> (Option<String>, Option<String>, bool) {
+        connection
+            .query_row(
+                "SELECT policy_verdict, block_reason, prompt_injection
+                 FROM request_records WHERE request_id = ?1",
+                params![request_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    fn remove_body_policy_columns(connection: &Connection) {
+        connection
+            .execute_batch(
+                "ALTER TABLE request_records DROP COLUMN prompt_injection;
+                 ALTER TABLE request_records DROP COLUMN block_reason;
+                 ALTER TABLE request_records DROP COLUMN policy_verdict;",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn version_three_migration_preserves_records_as_unscanned() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open(&path).unwrap();
+        insert_job(&store, "job", 1, i64::MAX);
+        let known = admitted_request(&store, 1);
+        store
+            .finish_request(
+                known,
+                "completed",
+                Some(Usage {
+                    prompt_tokens: 2,
+                    completion_tokens: 3,
+                    total_tokens: 5,
+                }),
+                true,
+            )
+            .unwrap();
+        let unknown = admitted_request(&store, 1);
+        store.constrain_reservation(unknown, 0).unwrap();
+        store
+            .finish_request(unknown, "timeout", None, false)
+            .unwrap();
+        let pending = admitted_request(&store, 1);
+        store.constrain_reservation(pending, 0).unwrap();
+        drop(store);
+        let observer = Connection::open(&path).unwrap();
+        remove_body_policy_columns(&observer);
+        observer.pragma_update(None, "user_version", 3).unwrap();
+        let snapshot = || {
+            let mut statement = observer
+                .prepare(
+                    "SELECT request_id, job_id, admitted_at, finished_at, outcome,
+                            reserved_tokens, prompt_tokens, completion_tokens, total_tokens
+                     FROM request_records WHERE outcome != 'pending' ORDER BY request_id",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    (0..9)
+                        .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let before = snapshot();
+        let reopened = Store::open(&path).unwrap();
+        let after = snapshot();
+        assert_eq!(&after[..2], before.as_slice());
+        assert_eq!(after.len(), 3);
+        assert_eq!(request_state(&observer, pending).outcome, "interrupted");
+        assert_eq!(budget_state(&observer, "job"), (0, 5, 0));
+        assert_eq!(quota_state(&observer, "job"), ("active".to_owned(), 3));
+        for request_id in [known, unknown, pending] {
+            assert_eq!(policy_state(&observer, request_id), (None, None, false));
+            assert!(
+                reopened
+                    .record_body_policy(request_id, false, false)
+                    .is_err()
+            );
+        }
+        let fresh = admitted_request(&reopened, 1);
+        reopened.record_body_policy(fresh, false, true).unwrap();
+        assert_eq!(
+            policy_state(&observer, fresh),
+            (Some("allowed".to_owned()), None, true)
+        );
+    }
+
+    #[test]
+    fn body_policy_decisions_survive_completion_and_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open(&path).unwrap();
+        let observer = Connection::open(&path).unwrap();
+        let mut records = Vec::new();
+        let mut token = 0;
+        for blocked in [false, true] {
+            for prompt_injection in [false, true] {
+                for finish in [false, true] {
+                    token += 1;
+                    insert_job(&store, &format!("job-{token}"), token, i64::MAX);
+                    let request_id = admitted_request(&store, token);
+                    store.constrain_reservation(request_id, 0).unwrap();
+                    assert_eq!(policy_state(&observer, request_id), (None, None, false));
+                    store
+                        .record_body_policy(request_id, blocked, prompt_injection)
+                        .unwrap();
+                    let expected = (
+                        Some(if blocked { "blocked" } else { "allowed" }.to_owned()),
+                        blocked.then(|| "possible_secret".to_owned()),
+                        prompt_injection,
+                    );
+                    assert_eq!(policy_state(&observer, request_id), expected);
+                    let outcome = if finish {
+                        let outcome = if blocked { "rejected" } else { "completed" };
+                        store
+                            .finish_request(request_id, outcome, None, true)
+                            .unwrap();
+                        assert_eq!(policy_state(&observer, request_id), expected);
+                        outcome
+                    } else {
+                        "interrupted"
+                    };
+                    records.push((request_id, expected, outcome));
+                }
+            }
+        }
+        drop(store);
+        for _ in 0..2 {
+            let reopened = Store::open(&path).unwrap();
+            for (request_id, expected, outcome) in &records {
+                assert_eq!(&policy_state(&observer, *request_id), expected);
+                assert_eq!(&request_state(&observer, *request_id).outcome, outcome);
+                assert!(
+                    reopened
+                        .record_body_policy(*request_id, false, false)
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn body_policy_decisions_are_write_once_and_require_pending_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open(&path).unwrap();
+        let observer = Connection::open(&path).unwrap();
+        let mut token = 0;
+        for blocked in [false, true] {
+            for prompt_injection in [false, true] {
+                token += 1;
+                insert_job(&store, &format!("job-{token}"), token, i64::MAX);
+                let request_id = admitted_request(&store, token);
+                store
+                    .record_body_policy(request_id, blocked, prompt_injection)
+                    .unwrap();
+                let before = policy_state(&observer, request_id);
+                for retry_blocked in [false, true] {
+                    for retry_injection in [false, true] {
+                        assert!(
+                            store
+                                .record_body_policy(request_id, retry_blocked, retry_injection)
+                                .is_err()
+                        );
+                        assert_eq!(policy_state(&observer, request_id), before);
+                    }
+                }
+                store
+                    .finish_request(request_id, "rejected", None, true)
+                    .unwrap();
+                assert!(
+                    store
+                        .record_body_policy(request_id, blocked, prompt_injection)
+                        .is_err()
+                );
+                assert_eq!(policy_state(&observer, request_id), before);
+            }
+        }
+        insert_job(&store, "unscanned", 9, i64::MAX);
+        let unscanned = admitted_request(&store, 9);
+        store
+            .finish_request(unscanned, "cancelled", None, true)
+            .unwrap();
+        for invalid in [-1, 0, i64::MAX, unscanned] {
+            assert!(store.record_body_policy(invalid, false, true).is_err());
+        }
+        assert_eq!(policy_state(&observer, unscanned), (None, None, false));
+    }
+
+    #[test]
+    fn concurrent_body_policy_decisions_have_one_winner() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let first = Store::open(&path).unwrap();
+        let second = Store::open(&path).unwrap();
+        insert_job(&first, "job", 1, i64::MAX);
+        let request_id = admitted_request(&first, 1);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let first_barrier = barrier.clone();
+        let first = std::thread::spawn(move || {
+            first_barrier.wait();
+            first.record_body_policy(request_id, true, false).is_ok()
+        });
+        let second = std::thread::spawn(move || {
+            barrier.wait();
+            second.record_body_policy(request_id, false, true).is_ok()
+        });
+        let blocked_won = first.join().unwrap();
+        assert_ne!(blocked_won, second.join().unwrap());
+        let observer = Connection::open(&path).unwrap();
+        let expected = if blocked_won {
+            (
+                Some("blocked".to_owned()),
+                Some("possible_secret".to_owned()),
+                false,
+            )
+        } else {
+            (Some("allowed".to_owned()), None, true)
+        };
+        assert_eq!(policy_state(&observer, request_id), expected);
+    }
+
+    #[test]
+    fn body_policy_schema_rejects_noncanonical_audit_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open(&path).unwrap();
+        insert_job(&store, "job", 1, i64::MAX);
+        let request_id = admitted_request(&store, 1);
+        let observer = Connection::open(&path).unwrap();
+        for values in [
+            "NULL, 'possible_secret', 0",
+            "'allowed', 'possible_secret', 0",
+            "'blocked', NULL, 0",
+            "'blocked', 'other', 0",
+            "'other', NULL, 0",
+            "NULL, NULL, 1",
+            "'allowed', NULL, -1",
+            "'allowed', NULL, 2",
+            "'allowed', NULL, 0.5",
+            "'allowed', NULL, 'yes'",
+            "'allowed', NULL, NULL",
+        ] {
+            assert!(
+                observer
+                    .execute(
+                        &format!(
+                            "UPDATE request_records
+                             SET (policy_verdict, block_reason, prompt_injection) = ({values})
+                             WHERE request_id = ?1"
+                        ),
+                        params![request_id],
+                    )
+                    .is_err()
+            );
+            assert_eq!(policy_state(&observer, request_id), (None, None, false));
+        }
+        store.record_body_policy(request_id, true, true).unwrap();
+        assert_eq!(
+            policy_state(&observer, request_id),
+            (
+                Some("blocked".to_owned()),
+                Some("possible_secret".to_owned()),
+                true
+            )
+        );
+    }
+
     #[test]
     fn request_records_distinguish_unknown_zero_and_known_usage() {
         let directory = tempfile::tempdir().unwrap();
@@ -2418,6 +2740,7 @@ mod tests {
         store.constrain_reservation(pending, 0).unwrap();
         drop(store);
         let observer = Connection::open(&path).unwrap();
+        remove_body_policy_columns(&observer);
         observer
             .execute_batch(
                 "ALTER TABLE jobs DROP COLUMN tokens_unreported; PRAGMA user_version = 2;",
@@ -2445,6 +2768,7 @@ mod tests {
         let request = admitted_request(&store, 1);
         drop(store);
         let observer = Connection::open(&path).unwrap();
+        remove_body_policy_columns(&observer);
         observer
             .execute_batch(
                 "UPDATE jobs SET tokens_reserved = 0;
@@ -2628,6 +2952,7 @@ mod tests {
         insert_job(&store, "job", 1, i64::MAX);
         drop(store);
         let observer = Connection::open(&path).unwrap();
+        remove_body_policy_columns(&observer);
         observer
             .execute_batch(
                 "UPDATE jobs SET tokens_used = 1200;

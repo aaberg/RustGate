@@ -34,6 +34,7 @@ use crate::{
 
 mod accounting;
 mod budget;
+mod policy;
 mod streaming;
 mod usage;
 
@@ -45,6 +46,7 @@ struct ServiceState {
     control_token_hash: [u8; 32],
     upstream: reqwest::Client,
     in_flight: Arc<Semaphore>,
+    body_policy: policy::BodyPolicy,
 }
 
 #[derive(Serialize)]
@@ -73,6 +75,7 @@ struct IssuedJob<'a> {
 }
 
 pub fn router(config: Config, store: Store) -> anyhow::Result<Router> {
+    let body_policy = policy::BodyPolicy::new(&config)?;
     let upstream = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
@@ -87,6 +90,7 @@ pub fn router(config: Config, store: Store) -> anyhow::Result<Router> {
         config,
         store,
         upstream,
+        body_policy,
     });
     let control = Router::new()
         .route("/v1/jobs", post(issue_job))
@@ -274,6 +278,36 @@ async fn admitted_chat(
     {
         accounting.reject().await;
         return error(StatusCode::BAD_REQUEST, "Chat stream must be a boolean");
+    }
+    // Scan client data before authoritative prompt injection. The durable audit
+    // contains only fixed verdicts, never matching text or configured patterns.
+    let scan = state.body_policy.scan(&body);
+    let store = state.store.clone();
+    accounting = match tokio::task::spawn_blocking(move || {
+        let result =
+            store.record_body_policy(job.request_id, scan.possible_secret, scan.prompt_injection);
+        (result, accounting)
+    })
+    .await
+    {
+        Ok((Ok(()), accounting)) => accounting,
+        Ok((Err(_), accounting)) => {
+            accounting.reject().await;
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not record body policy",
+            );
+        }
+        Err(_) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not record body policy",
+            );
+        }
+    };
+    if scan.possible_secret {
+        accounting.reject().await;
+        return error(StatusCode::FORBIDDEN, "Body policy rejected request");
     }
     let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         accounting.reject().await;
@@ -570,6 +604,8 @@ mod tests {
             idle_timeout_seconds: 120,
             overall_timeout_seconds: 600,
             max_in_flight_requests: 64,
+            secret_scan_patterns: Config::default_secret_scan_patterns(),
+            prompt_injection_patterns: Config::default_prompt_injection_patterns(),
         }
     }
 
