@@ -95,6 +95,84 @@ async fn token(fixture: &Fixture) -> String {
     issued["token"].as_str().unwrap().to_owned()
 }
 
+const STREAM_BUDGET: i64 = 4096;
+
+async fn full_budget_token(fixture: &Fixture) -> String {
+    let mut job = valid_body();
+    job["max_tokens_total"] = json!(STREAM_BUDGET);
+    let (status, _, issued) = issue(fixture.app.clone(), job).await;
+    assert_eq!(status, StatusCode::CREATED);
+    issued["token"].as_str().unwrap().to_owned()
+}
+
+fn token_balances(fixture: &Fixture) -> (i64, i64, i64) {
+    Connection::open(&fixture.path)
+        .unwrap()
+        .query_row(
+            "SELECT tokens_used, tokens_unreported, tokens_reserved FROM jobs",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+}
+
+async fn budget_exhausted(fixture: &Fixture, token: &str) {
+    // Exhaustion must reject before consuming a body, and must not look like
+    // leaked in-flight capacity.
+    let unread = Body::from_stream(futures_util::stream::pending::<Chunk>());
+    let (status, headers, error) = bounded(send(fixture.app.clone(), chat(unread, token))).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    assert_private_error(&error);
+    assert_eq!(persisted(&fixture.path)["requests_used"], 1);
+}
+
+fn conservative_settlement_survives_duplicate_and_restart(
+    fixture: &Fixture,
+    expected: Option<i64>,
+) {
+    let balances = (
+        expected.unwrap_or(0),
+        STREAM_BUDGET - expected.unwrap_or(0),
+        0,
+    );
+    assert_eq!(token_balances(fixture), balances);
+    assert_eq!(persisted(&fixture.path)["status"], "exhausted");
+    let (request_id, prompt, completion, total): (i64, Option<i64>, Option<i64>, Option<i64>) =
+        Connection::open(&fixture.path)
+            .unwrap()
+            .query_row(
+                "SELECT request_id, prompt_tokens, completion_tokens, total_tokens
+                 FROM request_records ORDER BY request_id LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+    let usage = expected.map(|total_tokens| crate::store::Usage {
+        prompt_tokens: prompt.unwrap(),
+        completion_tokens: completion.unwrap(),
+        total_tokens,
+    });
+    assert_eq!(total, expected);
+    if let Some(usage) = usage {
+        assert_eq!(
+            usage.prompt_tokens + usage.completion_tokens,
+            usage.total_tokens
+        );
+    }
+    let before = accounting_record(fixture);
+    Store::open(&fixture.path)
+        .unwrap()
+        .finish_request(request_id, "completed", usage, false)
+        .unwrap();
+    assert_eq!(token_balances(fixture), balances);
+    assert_eq!(accounting_record(fixture), before);
+    drop(Store::open(&fixture.path).unwrap());
+    assert_eq!(token_balances(fixture), balances);
+    assert_eq!(accounting_record(fixture), before);
+    assert_eq!(persisted(&fixture.path)["requests_used"], 1);
+}
+
 async fn bounded<T>(future: impl std::future::Future<Output = T>) -> T {
     tokio::time::timeout(Duration::from_secs(5), future)
         .await
@@ -142,6 +220,8 @@ async fn deadline_transport_precedes_contended_accounting(overall: bool) {
         bounded(body.next()).await.unwrap().unwrap().as_ref(),
         report
     );
+    let reservation = token_balances(&fixture).2;
+    assert!(reservation > 8);
 
     // Reading the report synchronizes admission and known usage before taking
     // the external writer lock. Keep it held until transport termination and
@@ -168,6 +248,7 @@ async fn deadline_transport_precedes_contended_accounting(overall: bool) {
     wait_for_accounting(&fixture).await;
     assert_eq!(accounting_record(&fixture), ("timeout".to_owned(), Some(8)));
     assert_eq!(persisted(&fixture.path)["tokens_used"], 8);
+    assert_eq!(token_balances(&fixture), (8, reservation - 8, 0));
     let usage: (i64, i64, i64) = writer
         .query_row(
             "SELECT prompt_tokens, completion_tokens, total_tokens
@@ -714,6 +795,125 @@ fn timed_out_blocking_admission_remains_in_flight_until_worker_finishes() {
     blocked_admission_retains_capacity(true);
 }
 
+fn blocked_reservation_narrowing_retains_capacity(timeout: bool) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (fixture, _server, _chunks, mut captures) = fixture(|settings| {
+            settings.max_in_flight_requests = 1;
+            settings.overall_timeout_seconds = 1;
+        })
+        .await;
+        let token = full_budget_token(&fixture).await;
+        let (body_ready, body_entered) = tokio::sync::oneshot::channel();
+        let mut body_ready = Some(body_ready);
+        let (release_body, mut incoming) = mpsc::channel::<Chunk>(1);
+        let body = Body::from_stream(futures_util::stream::poll_fn(move |context| {
+            if let Some(ready) = body_ready.take() {
+                let _ = ready.send(());
+            }
+            incoming.poll_recv(context)
+        }));
+        let mut pending = Box::pin(fixture.app.clone().oneshot(chat(body, &token)));
+        bounded(async {
+            tokio::select! {
+                entered = body_entered => entered.unwrap(),
+                result = pending.as_mut() => panic!("request finished before reading its body: {result:?}"),
+            }
+        })
+        .await;
+        // Body polling happens only after the first transaction commits. This
+        // lock therefore blocks reservation narrowing, not initial admission.
+        assert_eq!(persisted(&fixture.path)["requests_used"], 1);
+        assert_eq!(token_balances(&fixture), (0, 0, STREAM_BUDGET));
+        let writer = Connection::open(&fixture.path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let mut body: Value = serde_json::from_str(&payload()).unwrap();
+        body["max_tokens"] = json!(1);
+        release_body
+            .send(Ok(Bytes::from(body.to_string())))
+            .await
+            .unwrap();
+        drop(release_body);
+        // Both the bytes and EOF are ready, so this poll runs synchronously
+        // through body parsing to spawning the second transaction's worker.
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        assert_eq!(accounting_record(&fixture), ("pending".to_owned(), None));
+        assert_eq!(token_balances(&fixture), (0, 0, STREAM_BUDGET));
+        if timeout {
+            assert_eq!(
+                bounded(pending).await.unwrap().status(),
+                StatusCode::GATEWAY_TIMEOUT
+            );
+        } else {
+            drop(pending);
+        }
+        let (status, headers, _) =
+            bounded(send(fixture.app.clone(), chat("{", &token))).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(headers[header::RETRY_AFTER], "1");
+        assert_eq!(accounting_record(&fixture), ("pending".to_owned(), None));
+        assert_eq!(token_balances(&fixture), (0, 0, STREAM_BUDGET));
+        assert_eq!(persisted(&fixture.path)["requests_used"], 1);
+        assert!(captures.try_recv().is_err());
+
+        writer.execute_batch("COMMIT").unwrap();
+        bounded(async {
+            loop {
+                let (status, _, _) = send(fixture.app.clone(), chat("{", &token)).await;
+                if status == StatusCode::SERVICE_UNAVAILABLE {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                break;
+            }
+        })
+        .await;
+        wait_for_accounting(&fixture).await;
+        assert_eq!(accounting_record(&fixture), ("cancelled".to_owned(), Some(0)));
+        assert_eq!(token_balances(&fixture), (0, 0, 0));
+        assert_eq!(persisted(&fixture.path)["requests_used"], 2);
+        assert_eq!(persisted(&fixture.path)["status"], "active");
+        let request_id = writer
+            .query_row(
+                "SELECT request_id FROM request_records ORDER BY request_id LIMIT 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        Store::open(&fixture.path)
+            .unwrap()
+            .finish_request(
+                request_id,
+                "cancelled",
+                Some(crate::store::Usage {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                }),
+                true,
+            )
+            .unwrap();
+        assert_eq!(token_balances(&fixture), (0, 0, 0));
+        assert_eq!(persisted(&fixture.path)["requests_used"], 2);
+        assert!(captures.try_recv().is_err());
+    });
+}
+
+#[test]
+fn cancelled_reservation_narrowing_retains_capacity_until_worker_finishes() {
+    blocked_reservation_narrowing_retains_capacity(false);
+}
+
+#[test]
+fn timed_out_reservation_narrowing_retains_capacity_until_worker_finishes() {
+    blocked_reservation_narrowing_retains_capacity(true);
+}
+
 fn accounting_record(fixture: &Fixture) -> (String, Option<i64>) {
     Connection::open(&fixture.path)
         .unwrap()
@@ -773,7 +973,7 @@ async fn streaming_usage_reconciles_after_done_without_double_counting_reports()
 async fn broken_stream_usage_is_unknown_unless_a_complete_report_was_received() {
     for known in [false, true] {
         let (fixture, _server, chunks, mut captures) = fixture(|_| {}).await;
-        let token = token(&fixture).await;
+        let token = full_budget_token(&fixture).await;
         let pending = tokio::spawn(fixture.app.clone().oneshot(chat(payload(), &token)));
         bounded(captures.recv()).await.unwrap();
         let first = if known {
@@ -805,6 +1005,79 @@ async fn broken_stream_usage_is_unknown_unless_a_complete_report_was_received() 
             persisted(&fixture.path)["tokens_used"],
             if known { 8 } else { 0 }
         );
+        conservative_settlement_survives_duplicate_and_restart(
+            &fixture,
+            if known { Some(8) } else { None },
+        );
+        budget_exhausted(&fixture, &token).await;
+        assert!(captures.try_recv().is_err());
+    }
+}
+
+#[tokio::test]
+async fn partial_sse_usage_never_refunds_an_interrupted_full_budget() {
+    for ending in ["clean_eof", "transport_error", "disconnect"] {
+        let (fixture, _server, chunks, mut captures) = fixture(|settings| {
+            settings.max_in_flight_requests = 1;
+        })
+        .await;
+        let token = full_budget_token(&fixture).await;
+        let report =
+            b"data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n\n";
+        chunks.send(Ok(Bytes::from_static(report))).await.unwrap();
+        let response = bounded(fixture.app.clone().oneshot(chat(payload(), &token)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        bounded(captures.recv()).await.unwrap();
+        assert_eq!(token_balances(&fixture), (0, 0, STREAM_BUDGET));
+        let mut body = response.into_body().into_data_stream();
+        assert_eq!(
+            bounded(body.next()).await.unwrap().unwrap().as_ref(),
+            report
+        );
+        // Duplicate cumulative snapshots cannot double-charge known usage.
+        chunks.send(Ok(Bytes::from_static(report))).await.unwrap();
+        assert_eq!(
+            bounded(body.next()).await.unwrap().unwrap().as_ref(),
+            report
+        );
+        let partial =
+            b"data: {\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":5,\"total_tokens\":13}}\n";
+        chunks.send(Ok(Bytes::from_static(partial))).await.unwrap();
+        assert_eq!(
+            bounded(body.next()).await.unwrap().unwrap().as_ref(),
+            partial
+        );
+        assert_eq!(accounting_record(&fixture), ("pending".to_owned(), None));
+        match ending {
+            "clean_eof" => {
+                drop(chunks);
+                assert!(bounded(body.next()).await.is_none());
+            }
+            "transport_error" => {
+                chunks
+                    .send(Err(io::Error::other("controlled interrupted usage")))
+                    .await
+                    .unwrap();
+                assert!(bounded(body.next()).await.unwrap().is_err());
+            }
+            "disconnect" => {
+                drop(body);
+                bounded(chunks.closed()).await;
+            }
+            _ => unreachable!(),
+        }
+        wait_for_accounting(&fixture).await;
+        let outcome = match ending {
+            "clean_eof" => "completed",
+            "transport_error" => "upstream_error",
+            _ => "disconnected",
+        };
+        assert_eq!(accounting_record(&fixture), (outcome.to_owned(), Some(8)));
+        conservative_settlement_survives_duplicate_and_restart(&fixture, Some(8));
+        budget_exhausted(&fixture, &token).await;
+        assert!(captures.try_recv().is_err());
     }
 }
 
@@ -834,11 +1107,11 @@ async fn disconnect_reconciles_unknown_usage_and_releases_capacity() {
 
 #[tokio::test]
 async fn usage_in_first_upstream_chunk_survives_disconnect_before_body_polling() {
-    let (fixture, _server, chunks, _captures) = fixture(|settings| {
+    let (fixture, _server, chunks, mut captures) = fixture(|settings| {
         settings.max_in_flight_requests = 1;
     })
     .await;
-    let token = token(&fixture).await;
+    let token = full_budget_token(&fixture).await;
     chunks.send(Ok(Bytes::from_static(
         b"data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n\n"
     ))).await.unwrap();
@@ -849,12 +1122,16 @@ async fn usage_in_first_upstream_chunk_survives_disconnect_before_body_polling()
         .unwrap();
     drop(response);
     bounded(chunks.closed()).await;
-    recovered(&fixture, &token).await;
+    wait_for_accounting(&fixture).await;
     assert_eq!(
         accounting_record(&fixture),
         ("disconnected".to_owned(), Some(8))
     );
     assert_eq!(persisted(&fixture.path)["tokens_used"], 8);
+    conservative_settlement_survives_duplicate_and_restart(&fixture, Some(8));
+    budget_exhausted(&fixture, &token).await;
+    bounded(captures.recv()).await.unwrap();
+    assert!(captures.try_recv().is_err());
 }
 
 #[test]
@@ -880,7 +1157,7 @@ fn background_finalization_keeps_timeout_outcome_when_runtime_shuts_down_immedia
             capacity.try_acquire_owned().unwrap(),
         );
         accounting.dispatched();
-        accounting.finish_in_background("timeout", None);
+        accounting.finish_in_background("timeout", None, false);
         // No executor yield after dispatch: an intermediate async task could be
         // cancelled before it transfers the intended outcome to a worker.
         fixture
@@ -899,9 +1176,12 @@ fn shutdown_after_observed_stream(
         .enable_all()
         .build()
         .unwrap();
-    let (fixture, _server, _chunks, _body) = runtime.block_on(async {
-        let (fixture, server, chunks, _captures) = fixture(|_| {}).await;
-        let token = token(&fixture).await;
+    let (fixture, _server, _chunks, _body, token) = runtime.block_on(async {
+        let (fixture, server, chunks, _captures) = fixture(|settings| {
+            settings.max_in_flight_requests = 1;
+        })
+        .await;
+        let token = full_budget_token(&fixture).await;
         chunks.send(Ok(Bytes::from_static(first))).await.unwrap();
         let response = bounded(fixture.app.clone().oneshot(chat(payload(), &token)))
             .await
@@ -916,7 +1196,7 @@ fn shutdown_after_observed_stream(
         assert_eq!(accounting_record(&fixture), ("pending".to_owned(), None));
         // Keep upstream and downstream open outside block_on. The runtime,
         // rather than a disconnect or EOF, must cancel the unfinished relay.
-        (fixture, server, chunks, body)
+        (fixture, server, chunks, body, token)
     });
     drop(runtime);
     assert_eq!(
@@ -928,6 +1208,12 @@ fn shutdown_after_observed_stream(
         expected.unwrap_or(0)
     );
     assert_eq!(persisted(&fixture.path)["requests_used"], 1);
+    conservative_settlement_survives_duplicate_and_restart(&fixture, expected);
+    let restarted = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    restarted.block_on(budget_exhausted(&fixture, &token));
 }
 
 #[test]
@@ -984,7 +1270,7 @@ fn rejected_shutdown_worker_still_persists_observed_usage() {
     let handle = runtime.handle().clone();
     let (fixture, accounting, capacity) = runtime.block_on(async {
         let fixture = Fixture::new();
-        let token = token(&fixture).await;
+        let token = full_budget_token(&fixture).await;
         let store = Store::open(&fixture.path).unwrap();
         let JobAdmission::Admitted(job) = store
             .admit_job(Sha256::digest(token.as_bytes()).into())
@@ -1016,5 +1302,130 @@ fn rejected_shutdown_worker_still_persists_observed_usage() {
         ("cancelled".to_owned(), Some(8))
     );
     assert_eq!(persisted(&fixture.path)["tokens_used"], 8);
+    conservative_settlement_survives_duplicate_and_restart(&fixture, Some(8));
     assert_eq!(capacity.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn sse_token_escrow_counts_choices_and_settles_known_or_missing_usage() {
+    for known in [false, true] {
+        let (fixture, _server, chunks, mut captures) = fixture(|_| {}).await;
+        let mut body: Value = serde_json::from_str(&payload()).unwrap();
+        body["n"] = json!(3);
+        body["max_completion_tokens"] = json!(100_000);
+        let mut expected = body.clone();
+        expected
+            .as_object_mut()
+            .unwrap()
+            .remove("max_completion_tokens");
+        expected["messages"].as_array_mut().unwrap().insert(
+            0,
+            json!({"role":"system","content":valid_body()["system_prompt"]}),
+        );
+        expected["stream_options"] = json!({"include_usage":true});
+        let prompt_bound = serde_json::to_vec(&expected).unwrap().len() as i64
+            + 256
+            + 32 * expected["messages"].as_array().unwrap().len() as i64;
+        let allowance = prompt_bound + 3 * 17;
+        let mut job = valid_body();
+        job["max_tokens_total"] = json!(allowance);
+        let (status, _, issued) = issue(fixture.app.clone(), job).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let token = issued["token"].as_str().unwrap();
+        let pending = tokio::spawn(fixture.app.clone().oneshot(chat(body.to_string(), token)));
+        let forwarded = bounded(captures.recv()).await.unwrap();
+        expected["max_completion_tokens"] = json!(17);
+        assert_eq!(forwarded, expected);
+        let balances = || {
+            Connection::open(&fixture.path)
+                .unwrap()
+                .query_row(
+                    "SELECT tokens_used, tokens_unreported, tokens_reserved FROM jobs",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        assert_eq!(balances(), (0, 0, allowance));
+        assert_eq!(persisted(&fixture.path)["status"], "active");
+        let first = if known {
+            b"data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n\n".as_slice()
+        } else {
+            b"data: {\"choices\":[]}\n\n".as_slice()
+        };
+        chunks
+            .send(Ok(Bytes::copy_from_slice(first)))
+            .await
+            .unwrap();
+        let response = bounded(pending).await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut stream = response.into_body().into_data_stream();
+        assert_eq!(
+            bounded(stream.next()).await.unwrap().unwrap().as_ref(),
+            first
+        );
+        assert_eq!(balances(), (0, 0, allowance));
+        // Even repeated cumulative usage reports must refund escrow only once.
+        if known {
+            chunks
+                .send(Ok(Bytes::copy_from_slice(first)))
+                .await
+                .unwrap();
+            assert_eq!(
+                bounded(stream.next()).await.unwrap().unwrap().as_ref(),
+                first
+            );
+        }
+        chunks
+            .send(Ok(Bytes::from_static(b"data: [DONE]\n\n")))
+            .await
+            .unwrap();
+        assert_eq!(
+            bounded(stream.next()).await.unwrap().unwrap(),
+            "data: [DONE]\n\n"
+        );
+        drop(chunks);
+        assert!(bounded(stream.next()).await.is_none());
+        wait_for_accounting(&fixture).await;
+        assert_eq!(
+            accounting_record(&fixture),
+            ("completed".to_owned(), if known { Some(8) } else { None })
+        );
+        assert_eq!(
+            balances(),
+            if known { (8, 0, 0) } else { (0, allowance, 0) }
+        );
+        assert_eq!(persisted(&fixture.path)["requests_used"], 1);
+        if known {
+            assert_eq!(persisted(&fixture.path)["status"], "active");
+            let (status, _, result) =
+                bounded(send(fixture.app.clone(), chat(body.to_string(), token))).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(result, json!({"recovered":true}));
+            let forwarded = bounded(captures.recv()).await.unwrap();
+            assert_eq!(
+                forwarded["max_completion_tokens"],
+                (allowance - 8 - prompt_bound) / 3
+            );
+            wait_for_accounting(&fixture).await;
+        } else {
+            assert_eq!(persisted(&fixture.path)["status"], "exhausted");
+            let unread =
+                Body::from_stream(futures_util::stream::pending::<Result<String, io::Error>>());
+            let (status, headers, error) =
+                bounded(send(fixture.app.clone(), chat(unread, token))).await;
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+            assert_private_error(&error);
+            assert_eq!(persisted(&fixture.path)["requests_used"], 1);
+            assert_eq!(balances(), (0, allowance, 0));
+        }
+        assert!(captures.try_recv().is_err());
+    }
 }

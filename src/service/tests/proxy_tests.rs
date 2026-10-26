@@ -268,6 +268,7 @@ async fn json_shape_and_exact_body_limit_are_enforced() {
         0,
         json!({"role": "system", "content": valid_body()["system_prompt"]}),
     );
+    body["max_tokens"] = json!(4096);
     assert_eq!(forwarded, body);
     assert_eq!(persisted(&fixture.path)["requests_used"], 14);
 }
@@ -565,6 +566,7 @@ async fn authoritative_prompt_is_first_once_without_trusting_client_claims() {
         let mut expected_messages = vec![operator.clone()];
         expected_messages.extend(remaining.as_array().unwrap().iter().cloned());
         expected["messages"] = json!(expected_messages);
+        expected["max_tokens"] = json!(4096);
         let captured = captures(mock.clone()).await;
         assert_eq!(
             captured.as_array().unwrap().last().unwrap()["body"],
@@ -664,11 +666,20 @@ async fn concurrent_admissions_stop_at_the_persisted_allowance_across_restart() 
     let mut requests = Vec::new();
     for _ in 0..32 {
         let app = fixture.app.clone();
-        let request = chat(chat_body().to_string(), Some(token));
         let barrier = barrier.clone();
+        let token = token.to_owned();
         requests.push(tokio::spawn(async move {
             barrier.wait().await;
-            send(app, request).await
+            loop {
+                let response = send(app.clone(), chat(chat_body().to_string(), Some(&token))).await;
+                if response.0 == StatusCode::TOO_MANY_REQUESTS
+                    && response.2 != json!({"error":{"message":"Request quota exhausted"}})
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    continue;
+                }
+                break response;
+            }
         }));
     }
     let responses = tokio::time::timeout(
@@ -922,4 +933,428 @@ async fn non_object_stream_options_are_charged_zero_without_upstream_attempts() 
     assert_eq!(known_zero_rejections, 5);
     assert_eq!(persisted(&fixture.path)["requests_used"], 5);
     assert_eq!(persisted(&fixture.path)["tokens_used"], 0);
+}
+
+fn prompt_bound(forwarded: &Value) -> i64 {
+    let mut prompt = forwarded.clone();
+    let fields = prompt.as_object_mut().unwrap();
+    fields.remove("max_tokens");
+    fields.remove("max_completion_tokens");
+    serde_json::to_vec(&prompt).unwrap().len() as i64
+        + 256
+        + 32 * prompt["messages"].as_array().unwrap().len() as i64
+}
+
+fn token_balances(fixture: &Fixture) -> (i64, i64, i64) {
+    Connection::open(&fixture.path)
+        .unwrap()
+        .query_row(
+            "SELECT tokens_used, tokens_unreported, tokens_reserved FROM jobs",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+}
+
+#[tokio::test]
+async fn generation_limits_are_prompt_aware_and_each_choice_is_reserved() {
+    let upstream = Router::new().route(
+        "/v1/chat/completions",
+        post(|Json(body): Json<Value>| async move {
+            Json(json!({
+                "forwarded":body,
+                "usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}
+            }))
+        }),
+    );
+    // Each case has an independent job, so its full allowance is available.
+    for (field, requested, n, allowance) in [
+        ("max_tokens", Some(17), 1, 10_000),
+        ("max_completion_tokens", Some(17), 3, 10_000),
+        ("max_tokens", Some(100_000), 1, 2_000),
+        ("max_completion_tokens", Some(100_000), 3, 2_000),
+        ("max_tokens", None, 1, 10_000),
+        ("max_tokens", None, 3, 2_000),
+    ] {
+        let (fixture, _upstream) = fixture(upstream.clone(), "").await;
+        let mut job = valid_body();
+        job["max_tokens_total"] = json!(allowance);
+        let (status, _, issued) = issue(fixture.app.clone(), job).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let mut body = chat_body();
+        // Count canonical UTF-8 bytes, including JSON escapes, not characters.
+        body["messages"][0]["content"] = json!("日本語 café\n\"quoted\"\\path\t");
+        body["n"] = json!(n);
+        if let Some(limit) = requested {
+            body[field] = json!(limit);
+        }
+        let (status, _, result) = send(
+            fixture.app.clone(),
+            chat(body.to_string(), issued["token"].as_str()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let forwarded = &result["forwarded"];
+        let expected_limit = requested
+            .unwrap_or(4096)
+            .min((allowance - prompt_bound(forwarded)) / n);
+        assert_eq!(forwarded[field], expected_limit);
+        let other = if field == "max_tokens" {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
+        assert!(forwarded.get(other).is_none());
+        assert_eq!(forwarded["n"], n);
+        assert_eq!(
+            forwarded["messages"],
+            json!([
+                {"role":"system","content":valid_body()["system_prompt"]},
+                {"role":"user","content":"日本語 café\n\"quoted\"\\path\t"}
+            ])
+        );
+        wait_for_accounting(&fixture).await;
+        assert_eq!(token_balances(&fixture), (8, 0, 0));
+    }
+}
+
+#[tokio::test]
+async fn invalid_generation_limits_and_predispatch_bodies_refund_token_escrow() {
+    let mock = crate::mock::router();
+    let (fixture, _upstream) = fixture(mock.clone(), "").await;
+    let mut job = valid_body();
+    job["max_tokens_total"] = json!(2_000);
+    let (status, _, issued) = issue(fixture.app.clone(), job).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let token = issued["token"].as_str();
+    let mut invalid = vec![
+        "{malformed".to_owned(),
+        json!({"messages":null}).to_string(),
+    ];
+    for field in ["max_tokens", "max_completion_tokens", "n"] {
+        for value in [
+            Value::Null,
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!("2"),
+            json!(true),
+            json!([]),
+            json!({}),
+            json!(i64::MAX as u64 + 1),
+        ] {
+            let mut body = chat_body();
+            body[field] = value;
+            invalid.push(body.to_string());
+        }
+    }
+    let mut both = chat_body();
+    both["max_tokens"] = json!(1);
+    both["max_completion_tokens"] = json!(1);
+    invalid.push(both.to_string());
+    for (index, body) in invalid.iter().enumerate() {
+        let (status, headers, error) = send(fixture.app.clone(), chat(body.clone(), token)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        assert_private_error(&error);
+        wait_for_accounting(&fixture).await;
+        assert_eq!(token_balances(&fixture), (0, 0, 0));
+        assert_eq!(persisted(&fixture.path)["requests_used"], index + 1);
+        assert_eq!(persisted(&fixture.path)["status"], "active");
+    }
+    let mut oversized_prompt = chat_body();
+    oversized_prompt["messages"][0]["content"] = json!("x".repeat(2_000));
+    let (status, headers, error) = send(
+        fixture.app.clone(),
+        chat(oversized_prompt.to_string(), token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    assert_private_error(&error);
+    wait_for_accounting(&fixture).await;
+    assert_eq!(token_balances(&fixture), (0, 0, 0));
+    assert_eq!(persisted(&fixture.path)["requests_used"], invalid.len() + 1);
+    assert_eq!(persisted(&fixture.path)["status"], "active");
+    assert_eq!(captures(mock.clone()).await, json!([]));
+    // All refunded tokens remain usable by a genuine upstream request.
+    assert_eq!(
+        send(fixture.app.clone(), chat(chat_body().to_string(), token))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    wait_for_accounting(&fixture).await;
+    assert_eq!(token_balances(&fixture), (8, 0, 0));
+    assert_eq!(captures(mock).await.as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn held_calls_cannot_overreserve_and_known_usage_refunds_only_unused_tokens() {
+    let (captured, mut captures) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(Semaphore::new(0));
+    let upstream_release = release.clone();
+    let upstream = Router::new().route(
+        "/v1/chat/completions",
+        post(move |Json(body): Json<Value>| {
+            let captured = captured.clone();
+            let release = upstream_release.clone();
+            async move {
+                captured.send(body).unwrap();
+                release.acquire().await.unwrap().forget();
+                Json(json!({"usage":{
+                    "prompt_tokens":5,"completion_tokens":3,"total_tokens":8
+                }}))
+            }
+        }),
+    );
+    let (fixture, _upstream) = fixture(upstream, "").await;
+    let mut job = valid_body();
+    job["max_tokens_total"] = json!(2_000);
+    let (status, _, issued) = issue(fixture.app.clone(), job).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let token = issued["token"].as_str().unwrap();
+    let mut body = chat_body();
+    body["max_tokens"] = json!(100_000);
+    let first = tokio::spawn(send(
+        fixture.app.clone(),
+        chat(body.to_string(), Some(token)),
+    ));
+    let forwarded = tokio::time::timeout(std::time::Duration::from_secs(5), captures.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(forwarded["max_tokens"], 2_000 - prompt_bound(&forwarded));
+    assert_eq!(token_balances(&fixture), (0, 0, 2_000));
+    assert_eq!(persisted(&fixture.path)["status"], "active");
+    let mut denied = Vec::new();
+    for _ in 0..16 {
+        denied.push(tokio::spawn(bounded_send(
+            fixture.app.clone(),
+            chat(unread_body(), Some(token)),
+        )));
+    }
+    for response in denied {
+        let (status, headers, error) = response.await.unwrap();
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        assert_private_error(&error);
+    }
+    assert_eq!(persisted(&fixture.path)["requests_used"], 1);
+    assert_eq!(token_balances(&fixture), (0, 0, 2_000));
+    assert!(captures.try_recv().is_err());
+    release.add_permits(1);
+    assert_eq!(first.await.unwrap().0, StatusCode::OK);
+    wait_for_accounting(&fixture).await;
+    assert_eq!(token_balances(&fixture), (8, 0, 0));
+    let second = tokio::spawn(send(
+        fixture.app.clone(),
+        chat(body.to_string(), Some(token)),
+    ));
+    let forwarded = tokio::time::timeout(std::time::Duration::from_secs(5), captures.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(forwarded["max_tokens"], 1_992 - prompt_bound(&forwarded));
+    assert_eq!(token_balances(&fixture), (8, 0, 1_992));
+    assert_eq!(persisted(&fixture.path)["requests_used"], 2);
+    release.add_permits(1);
+    assert_eq!(second.await.unwrap().0, StatusCode::OK);
+    wait_for_accounting(&fixture).await;
+    assert_eq!(token_balances(&fixture), (16, 0, 0));
+}
+
+#[tokio::test]
+async fn successful_missing_usage_burns_full_nonstreaming_reservation_but_stays_null() {
+    let upstream = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async { Json(json!({"choices":[]})) }),
+    );
+    let (fixture, _upstream) = fixture(upstream, "").await;
+    let mut job = valid_body();
+    job["max_tokens_total"] = json!(2_000);
+    let (status, _, issued) = issue(fixture.app.clone(), job).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let token = issued["token"].as_str();
+    let mut body = chat_body();
+    body["max_completion_tokens"] = json!(100_000);
+    let (status, _, result) = send(fixture.app.clone(), chat(body.to_string(), token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result, json!({"choices":[]}));
+    wait_for_accounting(&fixture).await;
+    assert_eq!(token_balances(&fixture), (0, 2_000, 0));
+    assert_eq!(persisted(&fixture.path)["status"], "exhausted");
+    let record: (String, Option<i64>, Option<i64>, Option<i64>) = Connection::open(&fixture.path)
+        .unwrap()
+        .query_row(
+            "SELECT outcome, prompt_tokens, completion_tokens, total_tokens
+                 FROM request_records",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(record, ("completed".to_owned(), None, None, None));
+    assert_eq!(
+        bounded_send(fixture.app.clone(), chat(unread_body(), token))
+            .await
+            .0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(persisted(&fixture.path)["requests_used"], 1);
+    assert_eq!(token_balances(&fixture), (0, 2_000, 0));
+}
+
+#[tokio::test]
+async fn multimodal_and_unknown_content_fail_closed_without_spending_tokens() {
+    let mock = crate::mock::router();
+    let (fixture, _upstream) = fixture(mock.clone(), "").await;
+    let token = token(&fixture).await;
+    let mut invalid = Vec::new();
+    for part in [
+        json!({"type":"image_url","image_url":{"url":"https://example.invalid/image"}}),
+        json!({"type":"input_audio","input_audio":{"data":"AAAA","format":"wav"}}),
+        json!({"type":"video_url","video_url":{"url":"https://example.invalid/video"}}),
+        json!({"type":"file","file":{"file_id":"file-sensitive"}}),
+        json!({"type":"provider_extension","text":"not a proven text tokenizer input"}),
+        json!({"type":"text","text":null}),
+    ] {
+        let mut body = chat_body();
+        body["messages"][0]["content"] = json!([{"type":"text","text":"safe prefix"},part]);
+        invalid.push(body);
+    }
+    let mut message_audio = chat_body();
+    message_audio["messages"][0]["audio"] = json!({"id":"audio-sensitive"});
+    invalid.push(message_audio);
+    for (field, value) in [
+        ("audio", json!({"voice":"alloy","format":"wav"})),
+        ("input_audio", json!({"data":"AAAA","format":"wav"})),
+        ("image", json!({"url":"https://example.invalid/image"})),
+        ("video", json!({"url":"https://example.invalid/video"})),
+        ("file", json!({"file_id":"file-sensitive"})),
+        ("modalities", json!(["text", "audio"])),
+        ("web_search_options", json!({})),
+        ("tools", json!([{"type":"web_search"}])),
+    ] {
+        let mut body = chat_body();
+        body[field] = value;
+        invalid.push(body);
+    }
+    for (index, body) in invalid.iter().enumerate() {
+        let (status, headers, error) =
+            send(fixture.app.clone(), chat(body.to_string(), Some(&token))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        assert_private_error(&error);
+        wait_for_accounting(&fixture).await;
+        assert_eq!(token_balances(&fixture), (0, 0, 0));
+        assert_eq!(persisted(&fixture.path)["requests_used"], index + 1);
+    }
+    assert_eq!(captures(mock.clone()).await, json!([]));
+    let rejected: i64 = Connection::open(&fixture.path)
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM request_records WHERE outcome='rejected'
+             AND prompt_tokens=0 AND completion_tokens=0 AND total_tokens=0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rejected, invalid.len() as i64);
+    assert_eq!(
+        send(
+            fixture.app.clone(),
+            chat(chat_body().to_string(), Some(&token))
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(captures(mock).await.as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn every_requested_choice_must_afford_at_least_one_output_token() {
+    let (captured, mut captures) = tokio::sync::mpsc::unbounded_channel();
+    let upstream = Router::new().route(
+        "/v1/chat/completions",
+        post(move |Json(body): Json<Value>| {
+            let captured = captured.clone();
+            async move {
+                captured.send(body).unwrap();
+                Json(json!({"usage":{
+                    "prompt_tokens":0,"completion_tokens":0,"total_tokens":0
+                }}))
+            }
+        }),
+    );
+    let (fixture, _upstream) = fixture(upstream, "").await;
+    let mut body = chat_body();
+    body["messages"][0]["content"] = json!("日本語\n\"quoted\"\\path\t");
+    body["n"] = json!(3);
+    body["max_tokens"] = json!(10);
+    let mut transformed = body.clone();
+    transformed["messages"].as_array_mut().unwrap().insert(
+        0,
+        json!({"role":"system","content":valid_body()["system_prompt"]}),
+    );
+    let mut job = valid_body();
+    // Enough room for two one-token choices, but never three.
+    job["max_tokens_total"] = json!(prompt_bound(&transformed) + 2);
+    let (status, _, issued) = issue(fixture.app.clone(), job).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let token = issued["token"].as_str();
+    let (status, headers, error) = send(fixture.app.clone(), chat(body.to_string(), token)).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    assert_private_error(&error);
+    wait_for_accounting(&fixture).await;
+    assert_eq!(token_balances(&fixture), (0, 0, 0));
+    assert_eq!(persisted(&fixture.path)["requests_used"], 1);
+    assert_eq!(persisted(&fixture.path)["status"], "active");
+    assert!(captures.try_recv().is_err());
+    body["n"] = json!(2);
+    let (status, _, _) = send(fixture.app.clone(), chat(body.to_string(), token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let forwarded = captures.try_recv().unwrap();
+    transformed["n"] = json!(2);
+    transformed["max_tokens"] = json!(1);
+    assert_eq!(forwarded, transformed);
+    wait_for_accounting(&fixture).await;
+    assert_eq!(token_balances(&fixture), (0, 0, 0));
+    assert_eq!(persisted(&fixture.path)["requests_used"], 2);
+}
+
+#[tokio::test]
+async fn migrated_overspent_jobs_are_permanently_denied_on_the_first_attempt() {
+    let mock = crate::mock::router();
+    let (mut fixture, upstream) = fixture(mock.clone(), "").await;
+    let token = token(&fixture).await;
+    let observer = Connection::open(&fixture.path).unwrap();
+    // Version 2 could retain active jobs already at or beyond their token cap.
+    observer
+        .execute_batch(
+            "UPDATE jobs SET tokens_used = max_tokens_total, requests_used = 7;
+         ALTER TABLE jobs DROP COLUMN tokens_unreported;
+         PRAGMA user_version = 2;",
+        )
+        .unwrap();
+    let mut settings = config(fixture.path.clone());
+    settings.upstream_base_url = format!("http://{}", upstream.address).parse().unwrap();
+    fixture.app = router(settings, Store::open(&fixture.path).unwrap()).unwrap();
+    for _ in 0..2 {
+        let (status, headers, body) =
+            bounded_send(fixture.app.clone(), chat(unread_body(), Some(&token))).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(!headers.contains_key(header::RETRY_AFTER));
+        assert!(!headers.contains_key(header::WWW_AUTHENTICATE));
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        assert_private_error(&body);
+        assert_eq!(persisted(&fixture.path)["status"], "exhausted");
+        assert_eq!(persisted(&fixture.path)["requests_used"], 7);
+    }
+    let records: i64 = observer
+        .query_row("SELECT count(*) FROM request_records", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(records, 0);
+    assert_eq!(captures(mock).await, json!([]));
 }

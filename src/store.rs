@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Clone)]
 pub struct Store {
@@ -38,6 +38,7 @@ pub(crate) struct AdmittedJob {
     pub request_id: i64,
     pub upstream_key_id: String,
     pub system_prompt: String,
+    pub reserved_tokens: i64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,6 +52,7 @@ pub(crate) struct Usage {
 pub(crate) enum JobAdmission {
     Unauthorized,
     Exhausted,
+    TokenLimited,
     Admitted(AdmittedJob),
 }
 
@@ -201,6 +203,15 @@ impl Store {
                 )
                 .context("could not migrate request accounting schema")?;
         }
+        if version <= 2 {
+            transaction
+                .execute_batch(
+                    "ALTER TABLE jobs ADD COLUMN tokens_unreported INTEGER NOT NULL DEFAULT 0
+                        CHECK(typeof(tokens_unreported) = 'integer' AND tokens_unreported >= 0);
+                     PRAGMA user_version = 3;",
+                )
+                .context("could not migrate token budget accounting schema")?;
+        }
         let now = epoch_seconds()?;
         let pending = {
             let mut statement = transaction
@@ -211,7 +222,14 @@ impl Store {
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         for request_id in pending {
-            finish_request_in_transaction(&transaction, request_id, "interrupted", None, now)?;
+            finish_request_in_transaction(
+                &transaction,
+                request_id,
+                "interrupted",
+                None,
+                false,
+                now,
+            )?;
         }
         transaction
             .execute(
@@ -266,8 +284,8 @@ impl Store {
         }
     }
 
-    /// Permanently charges admission on a blocking worker after materializing expiry.
-    /// The final permitted request keeps its snapshot even though it exhausts the job.
+    /// Atomically charges admission and escrows every currently available job token.
+    /// Temporary escrow shortages charge nothing; the last request keeps its snapshot.
     pub(crate) fn admit_job(&self, token_hash: [u8; 32]) -> Result<JobAdmission> {
         let mut connection = self
             .inner
@@ -284,12 +302,62 @@ impl Store {
         Ok(job)
     }
 
-    /// Persists the first terminal outcome and accounts known usage exactly once.
+    /// Shrinks an admitted request's escrow without rechecking the job lifecycle.
+    /// The blocking caller must retain its Accounting owner until this returns.
+    pub(crate) fn constrain_reservation(
+        &self,
+        request_id: i64,
+        reserved_tokens: i64,
+    ) -> Result<()> {
+        if reserved_tokens < 0 {
+            bail!("request reservation must be nonnegative");
+        }
+        let mut connection = self
+            .inner
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock failed"))?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("could not begin reservation constraint")?;
+        let (job_id, previous, job_reserved): (String, i64, i64) = transaction
+            .query_row(
+                "SELECT r.job_id, r.reserved_tokens, j.tokens_reserved
+                 FROM request_records r JOIN jobs j USING (job_id)
+                 WHERE r.request_id = ?1 AND r.outcome = 'pending'",
+                params![request_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .context("could not find pending request reservation")?;
+        let released = previous
+            .checked_sub(reserved_tokens)
+            .filter(|released| *released >= 0)
+            .context("request reservation cannot grow")?;
+        let remaining = job_reserved
+            .checked_sub(released)
+            .filter(|remaining| *remaining >= 0)
+            .context("request reservation exceeds job reservation")?;
+        transaction.execute(
+            "UPDATE request_records SET reserved_tokens = ?2 WHERE request_id = ?1",
+            params![request_id, reserved_tokens],
+        )?;
+        transaction.execute(
+            "UPDATE jobs SET tokens_reserved = ?2 WHERE job_id = ?1",
+            params![job_id, remaining],
+        )?;
+        transaction
+            .commit()
+            .context("could not commit reservation constraint")
+    }
+
+    /// Persists the first outcome and known usage, releasing escrow exactly once.
+    /// Only final usage refunds unused escrow; snapshots retain the uncertain remainder.
     pub(crate) fn finish_request(
         &self,
         request_id: i64,
         outcome: &str,
         usage: Option<Usage>,
+        usage_final: bool,
     ) -> Result<()> {
         if !matches!(
             outcome,
@@ -314,7 +382,14 @@ impl Store {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("could not begin request completion")?;
-        finish_request_in_transaction(&transaction, request_id, outcome, usage, epoch_seconds()?)?;
+        finish_request_in_transaction(
+            &transaction,
+            request_id,
+            outcome,
+            usage,
+            usage_final,
+            epoch_seconds()?,
+        )?;
         transaction
             .commit()
             .context("could not commit request completion")
@@ -428,11 +503,13 @@ fn finish_request_in_transaction(
     request_id: i64,
     outcome: &str,
     usage: Option<Usage>,
+    usage_final: bool,
     now: i64,
 ) -> Result<()> {
     let pending = transaction
         .query_row(
-            "SELECT r.job_id, r.reserved_tokens, j.tokens_reserved, j.tokens_used
+            "SELECT r.job_id, r.reserved_tokens, j.tokens_reserved, j.tokens_used,
+                    j.tokens_unreported, j.max_tokens_total
              FROM request_records r JOIN jobs j ON j.job_id = r.job_id
              WHERE r.request_id = ?1 AND r.outcome = 'pending'",
             params![request_id],
@@ -442,21 +519,38 @@ fn finish_request_in_transaction(
                     row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
                 ))
             },
         )
         .optional()
         .context("could not read pending request accounting")?;
-    let Some((job_id, reserved, tokens_reserved, tokens_used)) = pending else {
+    let Some((job_id, reserved, tokens_reserved, tokens_used, tokens_unreported, maximum)) =
+        pending
+    else {
         return Ok(());
     };
     let remaining = tokens_reserved
         .checked_sub(reserved)
         .filter(|remaining| *remaining >= 0)
         .context("request reservation exceeds job reservation")?;
+    let known_tokens = usage.map_or(0, |usage| usage.total_tokens);
+    let uncertain_tokens = if usage.is_none() || !usage_final {
+        reserved
+            .checked_sub(known_tokens)
+            .context("request uncertain token subtraction overflow")?
+            .max(0)
+    } else {
+        0
+    };
     let tokens_used = tokens_used
-        .checked_add(usage.map_or(0, |usage| usage.total_tokens))
+        .checked_add(known_tokens)
         .context("job token usage overflow")?;
+    let tokens_unreported = tokens_unreported
+        .checked_add(uncertain_tokens)
+        .context("job unreported token usage overflow")?;
+    let exhausted = spent_budget(tokens_used, tokens_unreported, maximum)?;
     transaction
         .execute(
             "UPDATE request_records
@@ -475,8 +569,20 @@ fn finish_request_in_transaction(
         .context("could not finish request record")?;
     transaction
         .execute(
-            "UPDATE jobs SET tokens_reserved = ?2, tokens_used = ?3 WHERE job_id = ?1",
-            params![job_id, remaining, tokens_used],
+            "UPDATE jobs SET tokens_reserved = ?2, tokens_used = ?3, tokens_unreported = ?4,
+                 status = CASE
+                     WHEN status = 'active' AND expires_at <= ?6 THEN 'expired'
+                     WHEN status = 'active' AND ?5 THEN 'exhausted'
+                     ELSE status END
+             WHERE job_id = ?1",
+            params![
+                job_id,
+                remaining,
+                tokens_used,
+                tokens_unreported,
+                exhausted,
+                now
+            ],
         )
         .context("could not reconcile job token accounting")?;
     Ok(())
@@ -494,51 +600,111 @@ fn admit_job_in_transaction(
             params![token_hash.as_slice(), now],
         )
         .context("could not expire job during admission")?;
-    let admitted = transaction
+    let job = transaction
         .query_row(
-            "UPDATE jobs
-             SET requests_used = requests_used + 1,
-                 status = CASE WHEN requests_used = max_requests - 1
-                               THEN 'exhausted' ELSE 'active' END
-             WHERE token_hash = ?1 AND status = 'active' AND requests_used < max_requests
-             RETURNING job_id, upstream_key_id, system_prompt",
+            "SELECT job_id, upstream_key_id, system_prompt, status, requests_used,
+                    max_requests, max_tokens_total, tokens_used, tokens_unreported, tokens_reserved
+             FROM jobs WHERE token_hash = ?1",
             params![token_hash.as_slice()],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
                 ))
             },
         )
         .optional()
-        .context("could not charge job admission")?;
-    if let Some((job_id, upstream_key_id, system_prompt)) = admitted {
-        transaction
-            .execute(
-                "INSERT INTO request_records (job_id, admitted_at) VALUES (?1, ?2)",
-                params![job_id, now],
-            )
-            .context("could not record job admission")?;
-        return Ok(JobAdmission::Admitted(AdmittedJob {
-            request_id: transaction.last_insert_rowid(),
-            upstream_key_id,
-            system_prompt,
-        }));
+        .context("could not read job admission budget")?;
+    let Some((
+        job_id,
+        upstream_key_id,
+        system_prompt,
+        status,
+        requests_used,
+        max_requests,
+        maximum,
+        used,
+        unreported,
+        reserved,
+    )) = job
+    else {
+        return Ok(JobAdmission::Unauthorized);
+    };
+    if status == "exhausted" {
+        return Ok(JobAdmission::Exhausted);
     }
-    let exhausted = transaction
-        .query_row(
-            "SELECT status = 'exhausted' FROM jobs WHERE token_hash = ?1",
-            params![token_hash.as_slice()],
-            |row| row.get::<_, bool>(0),
+    if status != "active" {
+        return Ok(JobAdmission::Unauthorized);
+    }
+    if requests_used >= max_requests {
+        transaction.execute(
+            "UPDATE jobs SET status = 'exhausted' WHERE job_id = ?1 AND status = 'active'",
+            params![job_id],
+        )?;
+        return Ok(JobAdmission::Exhausted);
+    }
+    if spent_budget(used, unreported, maximum)? {
+        transaction.execute(
+            "UPDATE jobs SET status = 'exhausted' WHERE job_id = ?1 AND status = 'active'",
+            params![job_id],
+        )?;
+        return Ok(JobAdmission::Exhausted);
+    }
+    let available = maximum
+        .checked_sub(used)
+        .context("job token budget subtraction overflow")?
+        .max(0)
+        .checked_sub(unreported)
+        .context("job unreported budget subtraction overflow")?
+        .max(0)
+        .checked_sub(reserved)
+        .context("job reservation subtraction overflow")?
+        .max(0);
+    if available == 0 {
+        return Ok(JobAdmission::TokenLimited);
+    }
+    let requests_used = requests_used
+        .checked_add(1)
+        .context("job request count overflow")?;
+    let tokens_reserved = reserved
+        .checked_add(available)
+        .context("job reservation overflow")?;
+    transaction
+        .execute(
+            "UPDATE jobs SET requests_used = ?2, tokens_reserved = ?3,
+             status = CASE WHEN ?2 = max_requests THEN 'exhausted' ELSE status END
+         WHERE job_id = ?1",
+            params![job_id, requests_used, tokens_reserved],
         )
-        .optional()
-        .context("could not look up job admission status")?;
-    Ok(if exhausted == Some(true) {
-        JobAdmission::Exhausted
-    } else {
-        JobAdmission::Unauthorized
-    })
+        .context("could not charge job admission")?;
+    transaction.execute(
+        "INSERT INTO request_records (job_id, admitted_at, reserved_tokens) VALUES (?1, ?2, ?3)",
+        params![job_id, now, available],
+    ).context("could not record job admission")?;
+    Ok(JobAdmission::Admitted(AdmittedJob {
+        request_id: transaction.last_insert_rowid(),
+        upstream_key_id,
+        system_prompt,
+        reserved_tokens: available,
+    }))
+}
+
+fn spent_budget(used: i64, unreported: i64, maximum: i64) -> Result<bool> {
+    if used >= maximum {
+        return Ok(true);
+    }
+    Ok(unreported
+        >= maximum
+            .checked_sub(used)
+            .context("job token budget overflow")?)
 }
 
 #[cfg(test)]
@@ -592,6 +758,7 @@ mod tests {
                         completion_tokens: 5,
                         total_tokens: 12,
                     }),
+                    true,
                 )
                 .unwrap();
         });
@@ -643,6 +810,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(record, ("interrupted".to_owned(), None, 0));
+        assert_eq!(budget_state(&connection, "job"), (0, 0, 1_000));
+        assert_eq!(quota_state(&connection, "job"), ("exhausted".to_owned(), 1));
     }
 
     #[test]
@@ -780,6 +949,7 @@ mod tests {
                 request_id: 1,
                 upstream_key_id: "upstream".to_owned(),
                 system_prompt: "system".to_owned(),
+                reserved_tokens: 1_000,
             })
         );
         transaction.commit().unwrap();
@@ -814,6 +984,7 @@ mod tests {
                 request_id: 1,
                 upstream_key_id: "upstream".to_owned(),
                 system_prompt: "system".to_owned(),
+                reserved_tokens: 1_000,
             })
         );
 
@@ -1108,7 +1279,16 @@ mod tests {
                     let barrier = &barrier;
                     scope.spawn(move || {
                         barrier.wait();
-                        contender.admit_job([1; 32]).unwrap()
+                        loop {
+                            match contender.admit_job([1; 32]).unwrap() {
+                                JobAdmission::Admitted(job) => {
+                                    contender.constrain_reservation(job.request_id, 1).unwrap();
+                                    break JobAdmission::Admitted(job);
+                                }
+                                JobAdmission::TokenLimited => std::thread::yield_now(),
+                                other => break other,
+                            }
+                        }
                     })
                 })
                 .collect();
@@ -1174,6 +1354,7 @@ mod tests {
                 request_id: 1,
                 upstream_key_id: "chosen-key".to_owned(),
                 system_prompt: "chosen system prompt".to_owned(),
+                reserved_tokens: 1_000,
             })
         );
         drop(store);
@@ -1333,6 +1514,16 @@ mod tests {
             .unwrap()
     }
 
+    fn budget_state(connection: &Connection, job_id: &str) -> (i64, i64, i64) {
+        connection
+            .query_row(
+                "SELECT tokens_reserved, tokens_used, tokens_unreported FROM jobs WHERE job_id = ?1",
+                params![job_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
     #[derive(Debug, Eq, PartialEq)]
     struct RequestState {
         outcome: String,
@@ -1385,6 +1576,7 @@ mod tests {
         };
         for (index, usage) in [None, Some(zero), Some(known)].into_iter().enumerate() {
             let request_id = admitted_request(&store, 1);
+            store.constrain_reservation(request_id, 20).unwrap();
             assert_eq!(
                 request_state(&observer, request_id),
                 RequestState {
@@ -1401,9 +1593,9 @@ mod tests {
                 )
                 .unwrap();
             assert!(admitted_at > 0);
-            assert_eq!(reserved, 0);
+            assert_eq!(reserved, 20);
             store
-                .finish_request(request_id, "completed", usage)
+                .finish_request(request_id, "completed", usage, usage.is_some())
                 .unwrap();
             let snapshot = request_state(&observer, request_id);
             assert_eq!(snapshot.outcome, "completed");
@@ -1414,13 +1606,14 @@ mod tests {
             );
             assert_eq!(snapshot.usage, usage);
             store
-                .finish_request(request_id, "cancelled", Some(known))
+                .finish_request(request_id, "cancelled", Some(known), false)
                 .unwrap();
             assert_eq!(request_state(&observer, request_id), snapshot);
             assert_eq!(
                 token_state(&observer, "job"),
                 (0, if index == 2 { 18 } else { 0 })
             );
+            assert_eq!(budget_state(&observer, "job").2, 20);
         }
         assert_eq!(quota_state(&observer, "job"), ("active".to_owned(), 3));
         drop(store);
@@ -1438,9 +1631,10 @@ mod tests {
             (1, "done", Some(JobTransition::Done)),
             (2, "revoked", Some(JobTransition::Revoke)),
             (3, "exhausted", None),
+            (4, "expired", None),
         ] {
             insert_job(&store, status, token, i64::MAX);
-            if transition.is_none() {
+            if status == "exhausted" {
                 observer
                     .execute(
                         "UPDATE jobs SET max_requests = 1 WHERE job_id = ?1",
@@ -1449,34 +1643,37 @@ mod tests {
                     .unwrap();
             }
             let request_id = admitted_request(&store, token);
-            observer
-                .execute(
-                    "UPDATE jobs SET tokens_reserved = 25, tokens_used = 5 WHERE job_id = ?1",
-                    params![status],
-                )
-                .unwrap();
-            observer
-                .execute(
-                    "UPDATE request_records SET reserved_tokens = 25 WHERE request_id = ?1",
-                    params![request_id],
-                )
-                .unwrap();
+            assert_eq!(token_state(&observer, status), (1_000, 0));
             if let Some(transition) = transition {
                 store.transition_job(status, transition).unwrap();
             }
+            if status == "expired" {
+                observer
+                    .execute(
+                        "UPDATE jobs SET expires_at = 2 WHERE job_id = ?1",
+                        params![status],
+                    )
+                    .unwrap();
+                assert_eq!(
+                    store.admit_job([token; 32]).unwrap(),
+                    JobAdmission::Unauthorized
+                );
+            }
+            assert_eq!(token_state(&observer, status), (1_000, 0));
+            store.constrain_reservation(request_id, 25).unwrap();
             let snapshot = job_state(&observer, status);
             let usage = Usage {
-                prompt_tokens: 2,
-                completion_tokens: 3,
-                total_tokens: 5,
+                prompt_tokens: 500,
+                completion_tokens: 700,
+                total_tokens: 1_200,
             };
             store
-                .finish_request(request_id, "completed", Some(usage))
+                .finish_request(request_id, "completed", Some(usage), true)
                 .unwrap();
             store
-                .finish_request(request_id, "completed", Some(usage))
+                .finish_request(request_id, "completed", Some(usage), true)
                 .unwrap();
-            assert_eq!(token_state(&observer, status), (0, 10));
+            assert_eq!(token_state(&observer, status), (0, 1_200));
             assert_eq!(job_state(&observer, status), snapshot);
             assert_eq!(quota_state(&observer, status).1, 1);
         }
@@ -1494,18 +1691,7 @@ mod tests {
         insert_job(&first, "job", 1, i64::MAX);
         let request_id = admitted_request(&first, 1);
         let observer = Connection::open(&path).unwrap();
-        observer
-            .execute(
-                "UPDATE jobs SET tokens_reserved = 10 WHERE job_id = 'job'",
-                [],
-            )
-            .unwrap();
-        observer
-            .execute(
-                "UPDATE request_records SET reserved_tokens = 10 WHERE request_id = ?1",
-                params![request_id],
-            )
-            .unwrap();
+        first.constrain_reservation(request_id, 10).unwrap();
         let barrier = Barrier::new(2);
         let usage = Usage {
             prompt_tokens: 2,
@@ -1515,11 +1701,11 @@ mod tests {
         std::thread::scope(|scope| {
             let left = scope.spawn(|| {
                 barrier.wait();
-                first.finish_request(request_id, "completed", Some(usage))
+                first.finish_request(request_id, "completed", Some(usage), true)
             });
             let right = scope.spawn(|| {
                 barrier.wait();
-                second.finish_request(request_id, "timeout", None)
+                second.finish_request(request_id, "timeout", None, false)
             });
             left.join().unwrap().unwrap();
             right.join().unwrap().unwrap();
@@ -1530,10 +1716,12 @@ mod tests {
             "completed" => {
                 assert_eq!(state.usage, Some(usage));
                 assert_eq!(token_state(&observer, "job"), (0, 5));
+                assert_eq!(budget_state(&observer, "job").2, 0);
             }
             "timeout" => {
                 assert_eq!(state.usage, None);
                 assert_eq!(token_state(&observer, "job"), (0, 0));
+                assert_eq!(budget_state(&observer, "job").2, 10);
             }
             other => panic!("unexpected outcome {other}"),
         }
@@ -1552,29 +1740,13 @@ mod tests {
             total_tokens: 0,
         };
         store
-            .finish_request(completed, "completed", Some(zero))
+            .finish_request(completed, "completed", Some(zero), true)
             .unwrap();
         let first = admitted_request(&store, 1);
+        store.constrain_reservation(first, 10).unwrap();
         let second = admitted_request(&store, 1);
         let observer = Connection::open(&path).unwrap();
-        observer
-            .execute(
-                "UPDATE jobs SET tokens_reserved = 30, tokens_used = 7 WHERE job_id = 'job'",
-                [],
-            )
-            .unwrap();
-        observer
-            .execute(
-                "UPDATE request_records SET reserved_tokens = 10 WHERE request_id = ?1",
-                params![first],
-            )
-            .unwrap();
-        observer
-            .execute(
-                "UPDATE request_records SET reserved_tokens = 20 WHERE request_id = ?1",
-                params![second],
-            )
-            .unwrap();
+        store.constrain_reservation(second, 20).unwrap();
         store.transition_job("job", JobTransition::Done).unwrap();
         drop(store);
 
@@ -1589,18 +1761,18 @@ mod tests {
                 state
             })
             .collect();
-        assert_eq!(token_state(&observer, "job"), (0, 7));
+        assert_eq!(budget_state(&observer, "job"), (0, 0, 30));
         assert_eq!(quota_state(&observer, "job"), ("done".to_owned(), 3));
         assert_eq!(request_state(&observer, completed).usage, Some(zero));
         reopened
-            .finish_request(first, "completed", Some(zero))
+            .finish_request(first, "completed", Some(zero), true)
             .unwrap();
         drop(reopened);
         drop(Store::open(&path).unwrap());
         for (id, snapshot) in [first, second].into_iter().zip(snapshots) {
             assert_eq!(request_state(&observer, id), snapshot);
         }
-        assert_eq!(token_state(&observer, "job"), (0, 7));
+        assert_eq!(budget_state(&observer, "job"), (0, 0, 30));
     }
 
     #[test]
@@ -1640,12 +1812,20 @@ mod tests {
         ] {
             assert!(
                 store
-                    .finish_request(request_id, "completed", Some(usage))
+                    .finish_request(request_id, "completed", Some(usage), true)
                     .is_err()
             );
         }
-        assert!(store.finish_request(request_id, "pending", None).is_err());
-        assert!(store.finish_request(request_id, "invented", None).is_err());
+        assert!(
+            store
+                .finish_request(request_id, "pending", None, false)
+                .is_err()
+        );
+        assert!(
+            store
+                .finish_request(request_id, "invented", None, false)
+                .is_err()
+        );
         observer
             .execute(
                 "UPDATE jobs SET tokens_reserved = 10, tokens_used = ?1 WHERE job_id = 'job'",
@@ -1665,7 +1845,7 @@ mod tests {
         };
         assert!(
             store
-                .finish_request(request_id, "completed", Some(one))
+                .finish_request(request_id, "completed", Some(one), true)
                 .is_err()
         );
         assert_eq!(token_state(&observer, "job"), (10, i64::MAX));
@@ -1682,7 +1862,7 @@ mod tests {
             .unwrap();
         assert_eq!(kind, "integer");
         store
-            .finish_request(request_id, "upstream_error", None)
+            .finish_request(request_id, "upstream_error", None, false)
             .unwrap();
         assert_eq!(token_state(&observer, "job"), (0, i64::MAX));
     }
@@ -1710,11 +1890,10 @@ mod tests {
             .execute_batch("DROP TRIGGER reject_request;")
             .unwrap();
         let request_id = admitted_request(&store, 1);
+        store.constrain_reservation(request_id, 10).unwrap();
         observer
             .execute_batch(
-                "UPDATE jobs SET tokens_reserved = 10;
-             UPDATE request_records SET reserved_tokens = 10;
-             CREATE TRIGGER reject_accounting BEFORE UPDATE OF tokens_used ON jobs
+                "CREATE TRIGGER reject_accounting BEFORE UPDATE OF tokens_used ON jobs
              BEGIN SELECT RAISE(FAIL, 'accounting rejected'); END;",
             )
             .unwrap();
@@ -1725,7 +1904,7 @@ mod tests {
         };
         assert!(
             store
-                .finish_request(request_id, "completed", Some(usage))
+                .finish_request(request_id, "completed", Some(usage), true)
                 .is_err()
         );
         assert_eq!(token_state(&observer, "job"), (10, 0));
@@ -1735,7 +1914,7 @@ mod tests {
             .execute_batch("DROP TRIGGER reject_accounting;")
             .unwrap();
         store
-            .finish_request(request_id, "completed", Some(usage))
+            .finish_request(request_id, "completed", Some(usage), true)
             .unwrap();
         assert_eq!(token_state(&observer, "job"), (0, 5));
     }
@@ -1756,7 +1935,10 @@ mod tests {
             "cancelled",
         ] {
             let request_id = admitted_request(&store, 1);
-            store.finish_request(request_id, outcome, None).unwrap();
+            store.constrain_reservation(request_id, 10).unwrap();
+            store
+                .finish_request(request_id, outcome, None, false)
+                .unwrap();
             assert_eq!(request_state(&observer, request_id).outcome, outcome);
         }
         observer
@@ -1789,6 +1971,7 @@ mod tests {
         assert_eq!(count, 6);
         assert_eq!(quota_state(&observer, "job"), ("exhausted".to_owned(), 6));
         assert_eq!(token_state(&observer, "job"), (0, 0));
+        assert_eq!(budget_state(&observer, "job").2, 60);
     }
 
     fn create_legacy_database(connection: &Connection) {
@@ -1850,7 +2033,7 @@ mod tests {
             observer
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            2
+            SCHEMA_VERSION
         );
         let count: i64 = observer
             .query_row("SELECT count(*) FROM request_records", [], |row| row.get(0))
@@ -1983,6 +2166,7 @@ mod tests {
         assert!(Store::open(&path).is_err());
         for (request_id, job_id) in [(first, "first"), (second, "second")] {
             assert_eq!(token_state(&observer, job_id), (10, 0));
+            assert_eq!(budget_state(&observer, job_id).2, 0);
             assert_eq!(
                 request_state(&observer, request_id),
                 RequestState {
@@ -2003,5 +2187,572 @@ mod tests {
             assert_eq!(token_state(&observer, job_id), (0, 0));
             assert_eq!(request_state(&observer, request_id).outcome, "interrupted");
         }
+    }
+
+    #[test]
+    fn independent_connections_atomically_escrow_all_available_tokens() {
+        use std::sync::Barrier;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open(&path).unwrap();
+        let contenders: Vec<_> = (0..8).map(|_| Store::open(&path).unwrap()).collect();
+        insert_job(&store, "job", 1, i64::MAX);
+        let observer = Connection::open(&path).unwrap();
+        let barrier = Barrier::new(contenders.len());
+        let results = std::thread::scope(|scope| {
+            let workers: Vec<_> = contenders
+                .iter()
+                .map(|contender| {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        contender.admit_job([1; 32]).unwrap()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let admitted: Vec<_> = results
+            .iter()
+            .filter_map(|result| match result {
+                JobAdmission::Admitted(job) => Some(job),
+                other => {
+                    assert_eq!(*other, JobAdmission::TokenLimited);
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].reserved_tokens, 1_000);
+        assert_eq!(budget_state(&observer, "job"), (1_000, 0, 0));
+        assert_eq!(quota_state(&observer, "job"), ("active".to_owned(), 1));
+        assert_eq!(
+            observer
+                .query_row(
+                    "SELECT count(*), sum(reserved_tokens) FROM request_records",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+            (1, 1_000)
+        );
+
+        store
+            .constrain_reservation(admitted[0].request_id, 400)
+            .unwrap();
+        let JobAdmission::Admitted(second) = contenders[0].admit_job([1; 32]).unwrap() else {
+            panic!("narrowing must make the remaining budget available");
+        };
+        assert_eq!(second.reserved_tokens, 600);
+        assert_eq!(budget_state(&observer, "job"), (1_000, 0, 0));
+        assert_eq!(quota_state(&observer, "job"), ("active".to_owned(), 2));
+    }
+
+    #[test]
+    fn reservation_constraints_are_shrink_only_and_release_exactly_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open(&path).unwrap();
+        insert_job(&store, "job", 1, i64::MAX);
+        let observer = Connection::open(&path).unwrap();
+        let request = admitted_request(&store, 1);
+        store.constrain_reservation(request, 300).unwrap();
+        store.constrain_reservation(request, 300).unwrap();
+        assert!(store.constrain_reservation(request, 301).is_err());
+        assert!(store.constrain_reservation(request, -1).is_err());
+        assert!(store.constrain_reservation(i64::MAX, 0).is_err());
+        assert_eq!(budget_state(&observer, "job"), (300, 0, 0));
+        let second = admitted_request(&store, 1);
+        store.constrain_reservation(second, 200).unwrap();
+        store.constrain_reservation(request, 100).unwrap();
+        assert_eq!(budget_state(&observer, "job"), (300, 0, 0));
+        let zero = Usage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+        };
+        store
+            .finish_request(request, "rejected", Some(zero), true)
+            .unwrap();
+        store
+            .finish_request(request, "timeout", None, false)
+            .unwrap();
+        assert!(store.constrain_reservation(request, 0).is_err());
+        assert_eq!(budget_state(&observer, "job"), (200, 0, 0));
+        store
+            .finish_request(second, "timeout", None, false)
+            .unwrap();
+        store
+            .finish_request(second, "completed", Some(zero), true)
+            .unwrap();
+        assert_eq!(budget_state(&observer, "job"), (0, 0, 200));
+        assert_eq!(request_state(&observer, second).usage, None);
+        assert_eq!(quota_state(&observer, "job"), ("active".to_owned(), 2));
+        let JobAdmission::Admitted(third) = store.admit_job([1; 32]).unwrap() else {
+            panic!("known zero must refund escrow without refunding request charges");
+        };
+        assert_eq!(third.reserved_tokens, 800);
+    }
+
+    #[test]
+    fn known_and_unknown_spending_exhaust_the_budget_without_fabricating_usage() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open(&path).unwrap();
+        insert_job(&store, "job", 1, i64::MAX);
+        let observer = Connection::open(&path).unwrap();
+        let first = admitted_request(&store, 1);
+        store.constrain_reservation(first, 300).unwrap();
+        store.finish_request(first, "timeout", None, false).unwrap();
+        let second = admitted_request(&store, 1);
+        let usage = Usage {
+            prompt_tokens: 200,
+            completion_tokens: 500,
+            total_tokens: 700,
+        };
+        store
+            .finish_request(second, "completed", Some(usage), true)
+            .unwrap();
+        assert_eq!(budget_state(&observer, "job"), (0, 700, 300));
+        assert_eq!(request_state(&observer, first).usage, None);
+        assert_eq!(request_state(&observer, second).usage, Some(usage));
+        assert_eq!(quota_state(&observer, "job"), ("exhausted".to_owned(), 2));
+        assert_eq!(store.admit_job([1; 32]).unwrap(), JobAdmission::Exhausted);
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(budget_state(&observer, "job"), (0, 700, 300));
+        assert_eq!(
+            reopened.admit_job([1; 32]).unwrap(),
+            JobAdmission::Exhausted
+        );
+    }
+
+    #[test]
+    fn reported_usage_over_the_reservation_is_recorded_truthfully_and_stops_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open(&path).unwrap();
+        insert_job(&store, "job", 1, i64::MAX);
+        let observer = Connection::open(&path).unwrap();
+        let first = admitted_request(&store, 1);
+        store.constrain_reservation(first, 10).unwrap();
+        let usage = Usage {
+            prompt_tokens: 1_000,
+            completion_tokens: 50,
+            total_tokens: 1_050,
+        };
+        store
+            .finish_request(first, "completed", Some(usage), true)
+            .unwrap();
+        assert_eq!(budget_state(&observer, "job"), (0, 1_050, 0));
+        assert_eq!(request_state(&observer, first).usage, Some(usage));
+        assert_eq!(store.admit_job([1; 32]).unwrap(), JobAdmission::Exhausted);
+        assert_eq!(quota_state(&observer, "job"), ("exhausted".to_owned(), 1));
+    }
+
+    #[test]
+    fn maximum_integer_budget_never_promotes_accounting_to_sqlite_real() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open(&path).unwrap();
+        insert_job(&store, "job", 1, i64::MAX);
+        let observer = Connection::open(&path).unwrap();
+        observer
+            .execute(
+                "UPDATE jobs SET max_tokens_total = ?1, tokens_used = ?2, tokens_unreported = 1",
+                params![i64::MAX, i64::MAX - 3],
+            )
+            .unwrap();
+        let JobAdmission::Admitted(request) = store.admit_job([1; 32]).unwrap() else {
+            panic!("the last two tokens must remain usable");
+        };
+        assert_eq!(request.reserved_tokens, 2);
+        assert_eq!(
+            store.admit_job([1; 32]).unwrap(),
+            JobAdmission::TokenLimited
+        );
+        store
+            .finish_request(request.request_id, "timeout", None, false)
+            .unwrap();
+        assert_eq!(budget_state(&observer, "job"), (0, i64::MAX - 3, 3));
+        assert_eq!(quota_state(&observer, "job"), ("exhausted".to_owned(), 1));
+        let kinds: (String, String, String) = observer.query_row(
+            "SELECT typeof(tokens_used), typeof(tokens_unreported), typeof(tokens_reserved) FROM jobs",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(
+            kinds,
+            (
+                "integer".to_owned(),
+                "integer".to_owned(),
+                "integer".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn version_two_migration_preserves_legacy_unknown_zero_reservations() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open(&path).unwrap();
+        insert_job(&store, "job", 1, i64::MAX);
+        let known = admitted_request(&store, 1);
+        let usage = Usage {
+            prompt_tokens: 2,
+            completion_tokens: 3,
+            total_tokens: 5,
+        };
+        store
+            .finish_request(known, "completed", Some(usage), true)
+            .unwrap();
+        let unknown = admitted_request(&store, 1);
+        store.constrain_reservation(unknown, 0).unwrap();
+        store
+            .finish_request(unknown, "timeout", None, false)
+            .unwrap();
+        let pending = admitted_request(&store, 1);
+        store.constrain_reservation(pending, 0).unwrap();
+        drop(store);
+        let observer = Connection::open(&path).unwrap();
+        observer
+            .execute_batch(
+                "ALTER TABLE jobs DROP COLUMN tokens_unreported; PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(budget_state(&observer, "job"), (0, 5, 0));
+        assert_eq!(request_state(&observer, known).usage, Some(usage));
+        assert_eq!(request_state(&observer, unknown).usage, None);
+        assert_eq!(request_state(&observer, pending).usage, None);
+        assert_eq!(request_state(&observer, pending).outcome, "interrupted");
+        assert_eq!(quota_state(&observer, "job"), ("active".to_owned(), 3));
+        let JobAdmission::Admitted(request) = reopened.admit_job([1; 32]).unwrap() else {
+            panic!("legacy unknown records cannot be retroactively estimated");
+        };
+        assert_eq!(request.reserved_tokens, 995);
+    }
+
+    #[test]
+    fn failed_version_three_recovery_rolls_back_the_schema_and_unknown_spending() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open(&path).unwrap();
+        insert_job(&store, "job", 1, i64::MAX);
+        let request = admitted_request(&store, 1);
+        drop(store);
+        let observer = Connection::open(&path).unwrap();
+        observer
+            .execute_batch(
+                "UPDATE jobs SET tokens_reserved = 0;
+             ALTER TABLE jobs DROP COLUMN tokens_unreported;
+             PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        assert!(Store::open(&path).is_err());
+        assert_eq!(
+            observer
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert!(
+            observer
+                .prepare("SELECT tokens_unreported FROM jobs")
+                .is_err()
+        );
+        assert_eq!(request_state(&observer, request).outcome, "pending");
+        observer
+            .execute("UPDATE jobs SET tokens_reserved = 1000", [])
+            .unwrap();
+        drop(Store::open(&path).unwrap());
+        assert_eq!(budget_state(&observer, "job"), (0, 0, 1_000));
+        assert_eq!(request_state(&observer, request).outcome, "interrupted");
+    }
+
+    #[test]
+    fn completion_materializes_expiry_before_new_token_exhaustion() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open(&path).unwrap();
+        let observer = Connection::open(&path).unwrap();
+        for (token, total, earlier_exhausted) in
+            [(1, 5, false), (2, 1_000, false), (3, 1_000, true)]
+        {
+            let job_id = format!("job-{token}");
+            insert_job(&store, &job_id, token, 1_000);
+            if earlier_exhausted {
+                observer
+                    .execute(
+                        "UPDATE jobs SET max_requests = 1 WHERE job_id = ?1",
+                        params![job_id],
+                    )
+                    .unwrap();
+            }
+            let mut connection = store.inner.connection.lock().unwrap();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let JobAdmission::Admitted(request) =
+                admit_job_in_transaction(&transaction, [token; 32], 999).unwrap()
+            else {
+                panic!("request before expiry must be admitted");
+            };
+            let usage = Usage {
+                prompt_tokens: total,
+                completion_tokens: 0,
+                total_tokens: total,
+            };
+            finish_request_in_transaction(
+                &transaction,
+                request.request_id,
+                "completed",
+                Some(usage),
+                true,
+                1_000,
+            )
+            .unwrap();
+            assert_eq!(
+                admit_job_in_transaction(&transaction, [token; 32], 1_000).unwrap(),
+                if earlier_exhausted {
+                    JobAdmission::Exhausted
+                } else {
+                    JobAdmission::Unauthorized
+                }
+            );
+            transaction.commit().unwrap();
+            drop(connection);
+            assert_eq!(budget_state(&observer, &job_id), (0, total, 0));
+            assert_eq!(
+                request_state(&observer, request.request_id).usage,
+                Some(usage)
+            );
+            assert_eq!(
+                quota_state(&observer, &job_id),
+                (
+                    if earlier_exhausted {
+                        "exhausted"
+                    } else {
+                        "expired"
+                    }
+                    .to_owned(),
+                    1
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn startup_materializes_expiry_before_recovered_token_exhaustion() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open(&path).unwrap();
+        let observer = Connection::open(&path).unwrap();
+        let mut requests = Vec::new();
+        for (token, reservation, earlier_exhausted) in
+            [(1, 5, false), (2, 1_000, false), (3, 1_000, true)]
+        {
+            let job_id = format!("job-{token}");
+            insert_job(&store, &job_id, token, 1_000);
+            if earlier_exhausted {
+                observer
+                    .execute(
+                        "UPDATE jobs SET max_requests = 1 WHERE job_id = ?1",
+                        params![job_id],
+                    )
+                    .unwrap();
+            }
+            let mut connection = store.inner.connection.lock().unwrap();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let JobAdmission::Admitted(request) =
+                admit_job_in_transaction(&transaction, [token; 32], 999).unwrap()
+            else {
+                panic!("request before expiry must be admitted");
+            };
+            transaction.commit().unwrap();
+            drop(connection);
+            store
+                .constrain_reservation(request.request_id, reservation)
+                .unwrap();
+            requests.push((
+                job_id,
+                token,
+                reservation,
+                earlier_exhausted,
+                request.request_id,
+            ));
+        }
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        for (job_id, token, reservation, earlier_exhausted, request_id) in &requests {
+            assert_eq!(budget_state(&observer, job_id), (0, 0, *reservation));
+            assert_eq!(request_state(&observer, *request_id).outcome, "interrupted");
+            assert_eq!(
+                reopened.admit_job([*token; 32]).unwrap(),
+                if *earlier_exhausted {
+                    JobAdmission::Exhausted
+                } else {
+                    JobAdmission::Unauthorized
+                }
+            );
+            assert_eq!(
+                quota_state(&observer, job_id),
+                (
+                    if *earlier_exhausted {
+                        "exhausted"
+                    } else {
+                        "expired"
+                    }
+                    .to_owned(),
+                    1
+                )
+            );
+        }
+        drop(reopened);
+        drop(Store::open(&path).unwrap());
+        for (job_id, _, reservation, _, _) in requests {
+            assert_eq!(budget_state(&observer, &job_id), (0, 0, reservation));
+        }
+    }
+
+    #[test]
+    fn migrated_active_overspend_is_permanently_denied_without_charging() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open(&path).unwrap();
+        insert_job(&store, "job", 1, i64::MAX);
+        drop(store);
+        let observer = Connection::open(&path).unwrap();
+        observer
+            .execute_batch(
+                "UPDATE jobs SET tokens_used = 1200;
+                 ALTER TABLE jobs DROP COLUMN tokens_unreported;
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(quota_state(&observer, "job"), ("active".to_owned(), 0));
+        for _ in 0..2 {
+            assert_eq!(
+                reopened.admit_job([1; 32]).unwrap(),
+                JobAdmission::Exhausted
+            );
+            assert_eq!(quota_state(&observer, "job"), ("exhausted".to_owned(), 0));
+            assert_eq!(budget_state(&observer, "job"), (0, 1_200, 0));
+        }
+        let records: i64 = observer
+            .query_row("SELECT count(*) FROM request_records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(records, 0);
+    }
+
+    #[test]
+    fn nonfinal_known_usage_settles_snapshot_and_uncertain_remainder_exactly_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open(&path).unwrap();
+        let observer = Connection::open(&path).unwrap();
+        for (token, known, uncertain) in [(1, 0, 10), (2, 4, 6), (3, 10, 0), (4, 15, 0)] {
+            let job_id = format!("job-{token}");
+            insert_job(&store, &job_id, token, i64::MAX);
+            let request_id = admitted_request(&store, token);
+            store.constrain_reservation(request_id, 10).unwrap();
+            let usage = Usage {
+                prompt_tokens: known,
+                completion_tokens: 0,
+                total_tokens: known,
+            };
+            store
+                .finish_request(request_id, "timeout", Some(usage), false)
+                .unwrap();
+            let snapshot = request_state(&observer, request_id);
+            assert_eq!(snapshot.usage, Some(usage));
+            assert_eq!(snapshot.outcome, "timeout");
+            assert_eq!(budget_state(&observer, &job_id), (0, known, uncertain));
+            store
+                .finish_request(request_id, "completed", Some(usage), true)
+                .unwrap();
+            store
+                .finish_request(request_id, "disconnected", None, false)
+                .unwrap();
+            assert_eq!(request_state(&observer, request_id), snapshot);
+            assert_eq!(budget_state(&observer, &job_id), (0, known, uncertain));
+        }
+        drop(store);
+        drop(Store::open(&path).unwrap());
+        for (token, known, uncertain) in [(1, 0, 10), (2, 4, 6), (3, 10, 0), (4, 15, 0)] {
+            assert_eq!(
+                budget_state(&observer, &format!("job-{token}")),
+                (0, known, uncertain)
+            );
+        }
+    }
+
+    #[test]
+    fn nonfinal_known_usage_uses_checked_integer_accounting() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open(&path).unwrap();
+        insert_job(&store, "job", 1, i64::MAX);
+        let request_id = admitted_request(&store, 1);
+        store.constrain_reservation(request_id, 10).unwrap();
+        let observer = Connection::open(&path).unwrap();
+        let usage = Usage {
+            prompt_tokens: 4,
+            completion_tokens: 0,
+            total_tokens: 4,
+        };
+        for (used, unreported) in [(i64::MAX - 3, 0), (0, i64::MAX - 5)] {
+            observer
+                .execute(
+                    "UPDATE jobs SET tokens_used = ?1, tokens_unreported = ?2 WHERE job_id = 'job'",
+                    params![used, unreported],
+                )
+                .unwrap();
+            assert!(
+                store
+                    .finish_request(request_id, "timeout", Some(usage), false)
+                    .is_err()
+            );
+            assert_eq!(budget_state(&observer, "job"), (10, used, unreported));
+            let state = request_state(&observer, request_id);
+            assert_eq!(state.outcome, "pending");
+            assert_eq!(state.finished_at, None);
+            assert_eq!(state.usage, None);
+        }
+        observer
+            .execute(
+                "UPDATE jobs SET max_tokens_total = ?1, tokens_used = ?2, tokens_unreported = 0",
+                params![i64::MAX, i64::MAX - 10],
+            )
+            .unwrap();
+        store
+            .finish_request(request_id, "timeout", Some(usage), false)
+            .unwrap();
+        assert_eq!(budget_state(&observer, "job"), (0, i64::MAX - 6, 6));
+        assert_eq!(quota_state(&observer, "job"), ("exhausted".to_owned(), 1));
+        let kinds: (String, String, String) = observer
+            .query_row(
+                "SELECT typeof(tokens_used), typeof(tokens_unreported), typeof(tokens_reserved) FROM jobs",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            kinds,
+            (
+                "integer".to_owned(),
+                "integer".to_owned(),
+                "integer".to_owned()
+            )
+        );
+        store
+            .finish_request(request_id, "completed", Some(usage), true)
+            .unwrap();
+        assert_eq!(budget_state(&observer, "job"), (0, i64::MAX - 6, 6));
     }
 }

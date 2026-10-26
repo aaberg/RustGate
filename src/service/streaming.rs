@@ -38,15 +38,15 @@ pub(super) async fn forward(
     let (response, first) = match first {
         Ok(Ok(response)) => response,
         Ok(Err(failure)) if failure.is_timeout() => {
-            accounting.finish_in_background("timeout", None);
+            accounting.finish_in_background("timeout", None, false);
             return error(StatusCode::GATEWAY_TIMEOUT, "Upstream request timed out");
         }
         Ok(Err(_)) => {
-            accounting.finish_in_background("upstream_error", None);
+            accounting.finish_in_background("upstream_error", None, false);
             return error(StatusCode::BAD_GATEWAY, "Upstream request failed");
         }
         Err(_) => {
-            accounting.finish_in_background("timeout", None);
+            accounting.finish_in_background("timeout", None, false);
             return error(StatusCode::GATEWAY_TIMEOUT, "Upstream request timed out");
         }
     };
@@ -75,7 +75,8 @@ pub(super) async fn forward(
 
     let Some(first) = first else {
         drop(response);
-        accounting.finish_in_background(completed, usage.finish());
+        let known = usage.finish();
+        accounting.finish_in_background(completed, known, usage.is_final());
         return (status, headers, Body::empty()).into_response();
     };
     // Account bytes already received even if the downstream disconnects before
@@ -139,16 +140,17 @@ pub(super) async fn forward(
         let known = if outcome == completed && result.is_ok() {
             usage.finish()
         } else {
-            // A complete cumulative SSE report remains known even if the
-            // connection subsequently fails. Partial JSON never becomes usage.
+            // Preserve the last known snapshot without treating it as final:
+            // interrupted work may have consumed the remaining reservation.
             usage.observed()
         };
         // Transport completion must not wait for SQLite. The relay future has
         // already dropped upstream; retain accounting (and its permit) here
         // until the blocking reconciliation worker finishes.
+        let usage_final = outcome == completed && result.is_ok() && usage.is_final();
         drop(sender);
         let _ = finished.send(result);
-        accounting.finish(outcome, known).await;
+        accounting.finish(outcome, known, usage_final).await;
     });
     let chunks = stream::unfold(
         (receiver, Some(terminal)),

@@ -9,6 +9,7 @@ const MAX_SSE_BYTES: usize = 64 * 1024;
 pub(super) struct UsageTracker {
     parser: Parser,
     usage: Option<Usage>,
+    usage_final: bool,
 }
 
 enum Parser {
@@ -45,6 +46,7 @@ impl UsageTracker {
         Self {
             parser,
             usage: None,
+            usage_final: false,
         }
     }
 
@@ -63,15 +65,32 @@ impl UsageTracker {
     }
 
     pub(super) fn finish(&mut self) -> Option<Usage> {
-        if let Parser::Json(buffer) = std::mem::replace(&mut self.parser, Parser::Disabled) {
-            self.usage = parse_usage(&buffer);
+        match std::mem::replace(&mut self.parser, Parser::Disabled) {
+            Parser::Json(buffer) => {
+                self.usage = parse_usage(&buffer);
+                self.usage_final = self.usage.is_some();
+            }
+            Parser::Sse(parser) => {
+                // EOF cannot promote an earlier snapshot if later usage was
+                // malformed, discarded, or left in an incomplete event.
+                self.usage_final = self.usage.is_some()
+                    && parser.final_report
+                    && parser.line_len == 0
+                    && parser.event_len == 0
+                    && !parser.discard_event;
+            }
+            Parser::Disabled => {}
         }
-        // An SSE event is complete only at a blank line, never merely at EOF.
         self.usage
     }
 
     pub(super) fn observed(&self) -> Option<Usage> {
         self.usage
+    }
+
+    /// Meaningful only after clean upstream EOF and `finish()`.
+    pub(super) fn is_final(&self) -> bool {
+        self.usage_final
     }
 }
 
@@ -136,6 +155,7 @@ struct SseParser {
     discard_event: bool,
     skip_lf: bool,
     preamble: usize,
+    final_report: bool,
 }
 
 impl SseParser {
@@ -148,6 +168,7 @@ impl SseParser {
             discard_event: false,
             skip_lf: false,
             preamble: 0,
+            final_report: false,
         }
     }
 
@@ -197,11 +218,14 @@ impl SseParser {
 
     fn end_line(&mut self, usage: &mut Option<Usage>) {
         if self.line_len == 0 {
-            if !self.discard_event
-                && let Some(report) = parse_usage(&self.data)
-            {
-                // Reports are cumulative snapshots, not per-event increments.
-                *usage = Some(report);
+            if !self.discard_event {
+                if let Some(report) = parse_usage(&self.data) {
+                    // Reports are cumulative snapshots, not event increments.
+                    *usage = Some(report);
+                    self.final_report = true;
+                } else if !self.data.is_empty() && self.data != b"[DONE]\n" {
+                    self.final_report = false;
+                }
             }
             self.line.clear();
             self.data.clear();
@@ -237,6 +261,7 @@ impl SseParser {
 
     fn discard(&mut self) {
         self.discard_event = true;
+        self.final_report = false;
         self.line.clear();
         self.data.clear();
     }
@@ -267,6 +292,51 @@ mod tests {
         tracker.feed(b"data: ");
         tracker.feed(report);
         tracker.feed(b"\n\n");
+    }
+
+    #[test]
+    fn only_final_usage_refunds_the_uncertain_stream_remainder() {
+        for (tail, final_report) in [
+            (b"".as_slice(), true),
+            (b"data: [DONE]\n\n".as_slice(), true),
+            (b": keepalive\n\n".as_slice(), true),
+            (b"data: {\"usage\":null}\n\n".as_slice(), false),
+            (b"data: {\"choices\":[{}]}\n\n".as_slice(), false),
+            (b"data: malformed\n\n".as_slice(), false),
+            (b"data: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":7,\"total_tokens\":10}}\n".as_slice(), false),
+        ] {
+            let mut parser = tracker("text/event-stream");
+            event(&mut parser, REPORT);
+            parser.feed(tail);
+            assert_eq!(parser.observed(), expected(3, 2));
+            assert!(!parser.is_final(), "no final report before clean EOF");
+            assert_eq!(parser.finish(), expected(3, 2));
+            assert_eq!(parser.is_final(), final_report, "{tail:?}");
+        }
+
+        let mut parser = tracker("text/event-stream");
+        event(&mut parser, REPORT);
+        parser.feed(b"data: ");
+        parser.feed(&vec![b'x'; MAX_SSE_BYTES + 1]);
+        parser.feed(b"\n\n");
+        assert_eq!(parser.finish(), expected(3, 2));
+        assert!(
+            !parser.is_final(),
+            "discarded later usage cannot refund escrow"
+        );
+
+        let mut parser = tracker("text/event-stream");
+        event(&mut parser, REPORT);
+        event(&mut parser, b"invalid");
+        event(
+            &mut parser,
+            br#"{"usage":{"prompt_tokens":3,"completion_tokens":7,"total_tokens":10}}"#,
+        );
+        assert_eq!(parser.finish(), expected(3, 7));
+        assert!(
+            parser.is_final(),
+            "a later final cumulative report reconciles uncertainty"
+        );
     }
 
     #[test]
