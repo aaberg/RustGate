@@ -1018,3 +1018,127 @@ fn rejected_shutdown_worker_still_persists_observed_usage() {
     assert_eq!(persisted(&fixture.path)["tokens_used"], 8);
     assert_eq!(capacity.available_permits(), 1);
 }
+
+#[tokio::test]
+async fn sse_token_escrow_counts_choices_and_settles_known_or_missing_usage() {
+    for known in [false, true] {
+        let (fixture, _server, chunks, mut captures) = fixture(|_| {}).await;
+        let mut body: Value = serde_json::from_str(&payload()).unwrap();
+        body["n"] = json!(3);
+        body["max_completion_tokens"] = json!(100_000);
+        let mut expected = body.clone();
+        expected
+            .as_object_mut()
+            .unwrap()
+            .remove("max_completion_tokens");
+        expected["messages"].as_array_mut().unwrap().insert(
+            0,
+            json!({"role":"system","content":valid_body()["system_prompt"]}),
+        );
+        expected["stream_options"] = json!({"include_usage":true});
+        let prompt_bound = serde_json::to_vec(&expected).unwrap().len() as i64
+            + 256
+            + 32 * expected["messages"].as_array().unwrap().len() as i64;
+        let allowance = prompt_bound + 3 * 17;
+        let mut job = valid_body();
+        job["max_tokens_total"] = json!(allowance);
+        let (status, _, issued) = issue(fixture.app.clone(), job).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let token = issued["token"].as_str().unwrap();
+        let pending = tokio::spawn(fixture.app.clone().oneshot(chat(body.to_string(), token)));
+        let forwarded = bounded(captures.recv()).await.unwrap();
+        expected["max_completion_tokens"] = json!(17);
+        assert_eq!(forwarded, expected);
+        let balances = || {
+            Connection::open(&fixture.path)
+                .unwrap()
+                .query_row(
+                    "SELECT tokens_used, tokens_unreported, tokens_reserved FROM jobs",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        assert_eq!(balances(), (0, 0, allowance));
+        assert_eq!(persisted(&fixture.path)["status"], "active");
+        let first = if known {
+            b"data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n\n".as_slice()
+        } else {
+            b"data: {\"choices\":[]}\n\n".as_slice()
+        };
+        chunks
+            .send(Ok(Bytes::copy_from_slice(first)))
+            .await
+            .unwrap();
+        let response = bounded(pending).await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut stream = response.into_body().into_data_stream();
+        assert_eq!(
+            bounded(stream.next()).await.unwrap().unwrap().as_ref(),
+            first
+        );
+        assert_eq!(balances(), (0, 0, allowance));
+        // Even repeated cumulative usage reports must refund escrow only once.
+        if known {
+            chunks
+                .send(Ok(Bytes::copy_from_slice(first)))
+                .await
+                .unwrap();
+            assert_eq!(
+                bounded(stream.next()).await.unwrap().unwrap().as_ref(),
+                first
+            );
+        }
+        chunks
+            .send(Ok(Bytes::from_static(b"data: [DONE]\n\n")))
+            .await
+            .unwrap();
+        assert_eq!(
+            bounded(stream.next()).await.unwrap().unwrap(),
+            "data: [DONE]\n\n"
+        );
+        drop(chunks);
+        assert!(bounded(stream.next()).await.is_none());
+        wait_for_accounting(&fixture).await;
+        assert_eq!(
+            accounting_record(&fixture),
+            ("completed".to_owned(), if known { Some(8) } else { None })
+        );
+        assert_eq!(
+            balances(),
+            if known { (8, 0, 0) } else { (0, allowance, 0) }
+        );
+        assert_eq!(persisted(&fixture.path)["requests_used"], 1);
+        if known {
+            assert_eq!(persisted(&fixture.path)["status"], "active");
+            let (status, _, result) =
+                bounded(send(fixture.app.clone(), chat(body.to_string(), token))).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(result, json!({"recovered":true}));
+            let forwarded = bounded(captures.recv()).await.unwrap();
+            assert_eq!(
+                forwarded["max_completion_tokens"],
+                (allowance - 8 - prompt_bound) / 3
+            );
+            wait_for_accounting(&fixture).await;
+        } else {
+            assert_eq!(persisted(&fixture.path)["status"], "exhausted");
+            let unread =
+                Body::from_stream(futures_util::stream::pending::<Result<String, io::Error>>());
+            let (status, headers, error) =
+                bounded(send(fixture.app.clone(), chat(unread, token))).await;
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+            assert_private_error(&error);
+            assert_eq!(persisted(&fixture.path)["requests_used"], 1);
+            assert_eq!(balances(), (0, allowance, 0));
+        }
+        assert!(captures.try_recv().is_err());
+    }
+}

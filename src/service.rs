@@ -33,6 +33,7 @@ use crate::{
 };
 
 mod accounting;
+mod budget;
 mod streaming;
 mod usage;
 
@@ -165,6 +166,14 @@ fn unauthorized() -> Response {
     response
 }
 
+fn token_limited() -> Response {
+    let mut response = error(StatusCode::TOO_MANY_REQUESTS, "Token budget unavailable");
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+    response
+}
+
 async fn proxy_chat(State(state): State<Arc<ServiceState>>, request: Request) -> Response {
     let Some(token) = bearer_token(request.headers()) else {
         return unauthorized();
@@ -217,6 +226,9 @@ async fn admitted_chat(
         Ok((Ok(JobAdmission::Unauthorized), _)) => return unauthorized(),
         Ok((Ok(JobAdmission::Exhausted), _)) => {
             return error(StatusCode::TOO_MANY_REQUESTS, "Request quota exhausted");
+        }
+        Ok((Ok(JobAdmission::TokenLimited), _)) => {
+            return token_limited();
         }
         Ok((Err(_), _)) | Ok((Ok(JobAdmission::Admitted(_)), None)) | Err(_) => {
             return error(
@@ -290,6 +302,48 @@ async fn admitted_chat(
         // Ask compatible upstreams for the final cumulative usage report.
         options.insert("include_usage".to_owned(), Value::Bool(true));
     }
+
+    let reserved = match budget::constrain(&mut body, job.reserved_tokens) {
+        Ok(reserved) => reserved,
+        Err(failure) => {
+            accounting.reject().await;
+            return match failure {
+                budget::BudgetError::Invalid => error(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid chat token limit or choice count",
+                ),
+                budget::BudgetError::Unsupported => error(
+                    StatusCode::BAD_REQUEST,
+                    "Token budgets require text-only chat",
+                ),
+                budget::BudgetError::Insufficient => token_limited(),
+            };
+        }
+    };
+    let store = state.store.clone();
+    // A cancelled waiter cannot drop its permit or refund escrow while this
+    // blocking transaction is still running. Its output owns the finalizer.
+    accounting = match tokio::task::spawn_blocking(move || {
+        let result = store.constrain_reservation(job.request_id, reserved);
+        (result, accounting)
+    })
+    .await
+    {
+        Ok((Ok(()), accounting)) => accounting,
+        Ok((Err(_), accounting)) => {
+            accounting.reject().await;
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not reserve token budget",
+            );
+        }
+        Err(_) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not reserve token budget",
+            );
+        }
+    };
 
     // Start a fresh request: no client credentials, cookies, routing headers,
     // or hop-by-hop headers cross the upstream trust boundary.
