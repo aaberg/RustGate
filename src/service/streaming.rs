@@ -11,7 +11,11 @@ use tokio::{
     time::{Instant, timeout, timeout_at},
 };
 
-use super::{accounting::Accounting, error, usage::UsageTracker};
+use super::{
+    accounting::Accounting,
+    error,
+    usage::{UsageKind, UsageTracker},
+};
 
 /// Wait for an actual body byte (or clean EOF), not just response headers.
 /// Nothing is committed downstream until this succeeds, allowing a useful
@@ -19,6 +23,7 @@ use super::{accounting::Accounting, error, usage::UsageTracker};
 pub(super) async fn forward(
     request: reqwest::RequestBuilder,
     mut accounting: Accounting,
+    usage_kind: UsageKind,
     overall_deadline: Instant,
     first_byte_timeout: Duration,
     idle_timeout: Duration,
@@ -57,7 +62,7 @@ pub(super) async fn forward(
     } else {
         "upstream_error"
     };
-    let mut usage = UsageTracker::new(response.headers());
+    let mut usage = UsageTracker::new(response.headers(), usage_kind);
     let mut headers = HeaderMap::new();
     for name in [
         header::CONTENT_TYPE,

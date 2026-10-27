@@ -6,8 +6,16 @@ use crate::store::Usage;
 const MAX_JSON_BYTES: usize = 1024 * 1024;
 const MAX_SSE_BYTES: usize = 64 * 1024;
 
+#[derive(Clone, Copy)]
+pub(super) enum UsageKind {
+    Chat,
+    Embeddings,
+    Models,
+}
+
 pub(super) struct UsageTracker {
     parser: Parser,
+    usage_kind: UsageKind,
     usage: Option<Usage>,
     usage_final: bool,
 }
@@ -19,7 +27,19 @@ enum Parser {
 }
 
 impl UsageTracker {
-    pub(super) fn new(headers: &HeaderMap) -> Self {
+    pub(super) fn new(headers: &HeaderMap, usage_kind: UsageKind) -> Self {
+        if matches!(usage_kind, UsageKind::Models) {
+            return Self {
+                parser: Parser::Disabled,
+                usage_kind,
+                usage: Some(Usage {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                }),
+                usage_final: true,
+            };
+        }
         let identity_encoding = headers
             .get_all(header::CONTENT_ENCODING)
             .iter()
@@ -37,7 +57,7 @@ impl UsageTracker {
         } else {
             match content_type.map(|value| value.split(';').next().unwrap_or("").trim()) {
                 Some(value) if value.eq_ignore_ascii_case("text/event-stream") => {
-                    Parser::Sse(SseParser::new())
+                    Parser::Sse(SseParser::new(usage_kind))
                 }
                 Some(value) if is_json_media_type(value) => Parser::Json(Vec::new()),
                 _ => Parser::Disabled,
@@ -45,6 +65,7 @@ impl UsageTracker {
         };
         Self {
             parser,
+            usage_kind,
             usage: None,
             usage_final: false,
         }
@@ -67,7 +88,7 @@ impl UsageTracker {
     pub(super) fn finish(&mut self) -> Option<Usage> {
         match std::mem::replace(&mut self.parser, Parser::Disabled) {
             Parser::Json(buffer) => {
-                self.usage = parse_usage(&buffer);
+                self.usage = parse_usage(&buffer, self.usage_kind);
                 self.usage_final = self.usage.is_some();
             }
             Parser::Sse(parser) => {
@@ -107,7 +128,7 @@ fn is_json_media_type(value: &str) -> bool {
             || (subtype.len() > 5 && subtype[subtype.len() - 5..].eq_ignore_ascii_case("+json")))
 }
 
-fn parse_usage(bytes: &[u8]) -> Option<Usage> {
+fn parse_usage(bytes: &[u8], usage_kind: UsageKind) -> Option<Usage> {
     #[derive(Deserialize)]
     struct Envelope<'a> {
         #[serde(borrow)]
@@ -116,6 +137,13 @@ fn parse_usage(bytes: &[u8]) -> Option<Usage> {
     #[derive(Deserialize)]
     struct Report {
         prompt_tokens: i64,
+        completion_tokens: i64,
+        total_tokens: i64,
+    }
+    #[derive(Deserialize)]
+    struct EmbeddingReport {
+        prompt_tokens: i64,
+        #[serde(default)]
         completion_tokens: i64,
         total_tokens: i64,
     }
@@ -128,7 +156,21 @@ fn parse_usage(bytes: &[u8]) -> Option<Usage> {
     if !raw.get().starts_with('{') {
         return None;
     }
-    let report = serde_json::from_str::<Report>(raw.get()).ok()?;
+    let report = match usage_kind {
+        UsageKind::Chat => serde_json::from_str::<Report>(raw.get()).ok()?,
+        UsageKind::Embeddings => {
+            let report = serde_json::from_str::<EmbeddingReport>(raw.get()).ok()?;
+            if report.completion_tokens != 0 {
+                return None;
+            }
+            Report {
+                prompt_tokens: report.prompt_tokens,
+                completion_tokens: 0,
+                total_tokens: report.total_tokens,
+            }
+        }
+        UsageKind::Models => return None,
+    };
     let Report {
         prompt_tokens,
         completion_tokens,
@@ -148,6 +190,7 @@ fn parse_usage(bytes: &[u8]) -> Option<Usage> {
 }
 
 struct SseParser {
+    usage_kind: UsageKind,
     line: Vec<u8>,
     data: Vec<u8>,
     line_len: usize,
@@ -159,8 +202,9 @@ struct SseParser {
 }
 
 impl SseParser {
-    fn new() -> Self {
+    fn new(usage_kind: UsageKind) -> Self {
         Self {
+            usage_kind,
             line: Vec::new(),
             data: Vec::new(),
             line_len: 0,
@@ -219,7 +263,7 @@ impl SseParser {
     fn end_line(&mut self, usage: &mut Option<Usage>) {
         if self.line_len == 0 {
             if !self.discard_event {
-                if let Some(report) = parse_usage(&self.data) {
+                if let Some(report) = parse_usage(&self.data, self.usage_kind) {
                     // Reports are cumulative snapshots, not event increments.
                     *usage = Some(report);
                     self.final_report = true;
@@ -277,7 +321,7 @@ mod tests {
     fn tracker(content_type: &str) -> UsageTracker {
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
-        UsageTracker::new(&headers)
+        UsageTracker::new(&headers, UsageKind::Chat)
     }
 
     fn expected(prompt_tokens: i64, completion_tokens: i64) -> Option<Usage> {
@@ -292,6 +336,96 @@ mod tests {
         tracker.feed(b"data: ");
         tracker.feed(report);
         tracker.feed(b"\n\n");
+    }
+    #[test]
+    fn embeddings_allow_only_zero_or_absent_completion_tokens() {
+        for (bytes, prompt) in [
+            (
+                br#"{"usage":{"prompt_tokens":3,"total_tokens":3}}"#.as_slice(),
+                3,
+            ),
+            (
+                br#"{"usage":{"prompt_tokens":3,"completion_tokens":0,"total_tokens":3}}"#
+                    .as_slice(),
+                3,
+            ),
+            (
+                br#"{"usage":{"prompt_tokens":0,"total_tokens":0}}"#.as_slice(),
+                0,
+            ),
+        ] {
+            for content_type in ["application/json", "text/event-stream"] {
+                let mut headers = HeaderMap::new();
+                headers.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
+                let mut parser = UsageTracker::new(&headers, UsageKind::Embeddings);
+                if content_type == "text/event-stream" {
+                    event(&mut parser, bytes);
+                } else {
+                    parser.feed(bytes);
+                }
+                assert_eq!(parser.finish(), expected(prompt, 0));
+                assert!(parser.is_final());
+            }
+        }
+        assert_eq!(
+            parse_usage(
+                br#"{"usage":{"prompt_tokens":3,"total_tokens":3}}"#,
+                UsageKind::Chat,
+            ),
+            None,
+            "chat still requires completion_tokens",
+        );
+        assert_eq!(parse_usage(REPORT, UsageKind::Chat), expected(3, 2));
+    }
+
+    #[test]
+    fn malformed_embeddings_usage_remains_unknown() {
+        for bytes in [
+            REPORT,
+            br#"{"usage":{"prompt_tokens":3,"completion_tokens":-1,"total_tokens":2}}"#,
+            br#"{"usage":{"prompt_tokens":3,"completion_tokens":null,"total_tokens":3}}"#,
+            br#"{"usage":{"prompt_tokens":3,"completion_tokens":0.0,"total_tokens":3}}"#,
+            br#"{"usage":{"prompt_tokens":3,"total_tokens":4}}"#,
+            br#"{"usage":{"prompt_tokens":-3,"total_tokens":-3}}"#,
+            br#"{"usage":{"prompt_tokens":3}}"#,
+            br#"{"usage":{"total_tokens":3}}"#,
+            br#"{"usage":{"prompt_tokens":9223372036854775808,"total_tokens":9223372036854775808}}"#,
+            b"invalid",
+        ] {
+            for content_type in ["application/json", "text/event-stream"] {
+                let mut headers = HeaderMap::new();
+                headers.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
+                let mut parser = UsageTracker::new(&headers, UsageKind::Embeddings);
+                if content_type == "text/event-stream" {
+                    event(&mut parser, bytes);
+                } else {
+                    parser.feed(bytes);
+                }
+                assert_eq!(parser.observed(), None);
+                assert_eq!(parser.finish(), None);
+                assert!(!parser.is_final());
+            }
+        }
+    }
+
+    #[test]
+    fn models_ignore_headers_bodies_and_upstream_usage() {
+        for content_type in ["application/json", "text/event-stream", "text/plain"] {
+            for encoding in ["identity", "gzip"] {
+                let mut headers = HeaderMap::new();
+                headers.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
+                headers.insert(header::CONTENT_ENCODING, encoding.parse().unwrap());
+                let mut parser = UsageTracker::new(&headers, UsageKind::Models);
+                assert_eq!(parser.observed(), expected(0, 0));
+                assert!(parser.is_final());
+                parser.feed(REPORT);
+                event(&mut parser, REPORT);
+                parser.feed(b"malformed");
+                assert_eq!(parser.observed(), expected(0, 0));
+                assert_eq!(parser.finish(), expected(0, 0));
+                assert!(parser.is_final());
+            }
+        }
     }
 
     #[test]
@@ -510,14 +644,14 @@ mod tests {
             let mut headers = HeaderMap::new();
             headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
             headers.insert(header::CONTENT_ENCODING, encoding.parse().unwrap());
-            let mut parser = UsageTracker::new(&headers);
+            let mut parser = UsageTracker::new(&headers, UsageKind::Chat);
             parser.feed(REPORT);
             assert_eq!(parser.finish(), None);
         }
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
         headers.insert(header::CONTENT_ENCODING, "Identity".parse().unwrap());
-        let mut parser = UsageTracker::new(&headers);
+        let mut parser = UsageTracker::new(&headers, UsageKind::Chat);
         parser.feed(REPORT);
         assert_eq!(parser.finish(), expected(3, 2));
     }

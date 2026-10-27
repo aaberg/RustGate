@@ -1156,7 +1156,7 @@ fn background_finalization_keeps_timeout_outcome_when_runtime_shuts_down_immedia
             job.request_id,
             capacity.try_acquire_owned().unwrap(),
         );
-        accounting.dispatched();
+        accounting.dispatched(usage::UsageKind::Chat);
         accounting.finish_in_background("timeout", None, false);
         // No executor yield after dispatch: an intermediate async task could be
         // cancelled before it transfers the intended outcome to a worker.
@@ -1284,7 +1284,7 @@ fn rejected_shutdown_worker_still_persists_observed_usage() {
             job.request_id,
             capacity.clone().try_acquire_owned().unwrap(),
         );
-        accounting.dispatched();
+        accounting.dispatched(usage::UsageKind::Chat);
         accounting.observe_usage(Some(crate::store::Usage {
             prompt_tokens: 5,
             completion_tokens: 3,

@@ -5,6 +5,8 @@ use tokio::{net::TcpListener, task::JoinHandle};
 
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 
+mod endpoint_tests;
+
 struct Upstream {
     address: SocketAddr,
     task: JoinHandle<()>,
@@ -182,8 +184,8 @@ async fn allowlist_matches_exact_method_and_raw_path_before_parsing() {
         ("POST", "/v1/chat/%63ompletions"),
         ("POST", "/v1/chat/../chat/completions"),
         ("POST", "//v1/chat/completions"),
-        ("POST", "/v1/embeddings"),
-        ("GET", "/v1/models"),
+        ("GET", "/v1/embeddings"),
+        ("POST", "/v1/models"),
         ("POST", "/v1/admin"),
         ("POST", "/__mock/requests"),
         ("GET", "/v1/jobs"),

@@ -140,3 +140,66 @@ pub(super) fn constrain(body: &mut Value, available: i64) -> Result<i64, BudgetE
         .insert(limit_field.to_owned(), generation.into());
     Ok(reserved)
 }
+
+/// Embeddings generate no completion tokens. Bound each text/token input by
+/// canonical request bytes plus framing, without changing the client payload.
+pub(super) fn embeddings(body: &Value, available: i64) -> Result<i64, BudgetError> {
+    if !body
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(|model| !model.trim().is_empty())
+        || [
+            "stream",
+            "stream_options",
+            "max_tokens",
+            "max_completion_tokens",
+            "n",
+        ]
+        .iter()
+        .any(|field| body.get(field).is_some())
+        || body
+            .get("encoding_format")
+            .is_some_and(|value| !matches!(value.as_str(), Some("float" | "base64")))
+        || body
+            .get("dimensions")
+            .is_some_and(|value| positive_integer(value).is_err())
+        || body.get("user").is_some_and(|value| !value.is_string())
+    {
+        return Err(BudgetError::Invalid);
+    }
+    fn text(value: &Value) -> bool {
+        value.as_str().is_some_and(|text| !text.is_empty())
+    }
+    fn token(value: &Value) -> bool {
+        value
+            .as_u64()
+            .is_some_and(|token| u32::try_from(token).is_ok())
+    }
+    fn tokens(value: &Value) -> bool {
+        value
+            .as_array()
+            .is_some_and(|values| !values.is_empty() && values.iter().all(token))
+    }
+    let input = body.get("input").ok_or(BudgetError::Invalid)?;
+    let inputs = if text(input) || tokens(input) {
+        1
+    } else if let Some(inputs) = input.as_array()
+        && !inputs.is_empty()
+        && (inputs.iter().all(text) || inputs.iter().all(tokens))
+    {
+        i64::try_from(inputs.len()).map_err(|_| BudgetError::Invalid)?
+    } else {
+        return Err(BudgetError::Invalid);
+    };
+    let mut bytes = ByteCount(0);
+    serde_json::to_writer(&mut bytes, body).map_err(|_| BudgetError::Invalid)?;
+    let reserved = inputs
+        .checked_mul(MESSAGE_OVERHEAD)
+        .and_then(|overhead| overhead.checked_add(PROMPT_OVERHEAD))
+        .and_then(|overhead| overhead.checked_add(bytes.0))
+        .ok_or(BudgetError::Invalid)?;
+    if reserved > available {
+        return Err(BudgetError::Insufficient);
+    }
+    Ok(reserved)
+}

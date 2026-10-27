@@ -102,8 +102,8 @@ pub fn router(config: Config, store: Store) -> anyhow::Result<Router> {
     Ok(Router::new()
         .route("/healthz", get(|| async { Json(Health { status: "ok" }) }))
         .merge(control)
-        .fallback(proxy_chat)
-        .method_not_allowed_fallback(proxy_chat)
+        .fallback(proxy)
+        .method_not_allowed_fallback(proxy)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state))
 }
@@ -178,7 +178,7 @@ fn token_limited() -> Response {
     response
 }
 
-async fn proxy_chat(State(state): State<Arc<ServiceState>>, request: Request) -> Response {
+async fn proxy(State(state): State<Arc<ServiceState>>, request: Request) -> Response {
     let Some(token) = bearer_token(request.headers()) else {
         return unauthorized();
     };
@@ -196,7 +196,7 @@ async fn proxy_chat(State(state): State<Arc<ServiceState>>, request: Request) ->
     let deadline = Instant::now() + Duration::from_secs(state.config.overall_timeout_seconds);
     match timeout_at(
         deadline,
-        admitted_chat(state, request, token_hash, permit, deadline),
+        admitted_proxy(state, request, token_hash, permit, deadline),
     )
     .await
     {
@@ -205,7 +205,7 @@ async fn proxy_chat(State(state): State<Arc<ServiceState>>, request: Request) ->
     }
 }
 
-async fn admitted_chat(
+async fn admitted_proxy(
     state: Arc<ServiceState>,
     request: Request,
     token_hash: [u8; 32],
@@ -241,10 +241,15 @@ async fn admitted_chat(
             );
         }
     };
-    if request.method() != Method::POST || request.uri().path() != "/v1/chat/completions" {
-        accounting.reject().await;
-        return error(StatusCode::FORBIDDEN, "Forbidden route");
-    }
+    let kind = match (request.method(), request.uri().path()) {
+        (&Method::POST, "/v1/chat/completions") => usage::UsageKind::Chat,
+        (&Method::POST, "/v1/embeddings") => usage::UsageKind::Embeddings,
+        (&Method::GET, "/v1/models") => usage::UsageKind::Models,
+        _ => {
+            accounting.reject().await;
+            return error(StatusCode::FORBIDDEN, "Forbidden route");
+        }
+    };
     let Some(key) = state.config.upstream_keys.get(&job.upstream_key_id) else {
         // A persisted job may reference a key removed from the startup pool.
         accounting.reject().await;
@@ -252,107 +257,131 @@ async fn admitted_chat(
     };
     let mut url = state.config.upstream_base_url.clone();
     url.set_path(&format!(
-        "{}/v1/chat/completions",
-        url.path().trim_end_matches('/')
+        "{}{}",
+        url.path().trim_end_matches('/'),
+        request.uri().path()
     ));
     url.set_query(request.uri().query());
 
-    // Authentication and route checks precede body reads. Reserialization gives
-    // the proxy and upstream identical JSON semantics, including duplicate keys.
-    let mut body = match Json::<Value>::from_request(request, &state).await {
-        Ok(Json(body)) => body,
-        Err(rejection) => {
-            let status = if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
-                StatusCode::PAYLOAD_TOO_LARGE
-            } else {
-                StatusCode::BAD_REQUEST
-            };
-            accounting.reject().await;
-            return error(status, "Invalid JSON request");
-        }
-    };
-    if !body.is_object()
-        || body
-            .get("stream")
-            .is_some_and(|stream| !stream.is_boolean())
-    {
-        accounting.reject().await;
-        return error(StatusCode::BAD_REQUEST, "Chat stream must be a boolean");
-    }
-    // Scan client data before authoritative prompt injection. The durable audit
-    // contains only fixed verdicts, never matching text or configured patterns.
-    let scan = state.body_policy.scan(&body);
-    let store = state.store.clone();
-    accounting = match tokio::task::spawn_blocking(move || {
-        let result =
-            store.record_body_policy(job.request_id, scan.possible_secret, scan.prompt_injection);
-        (result, accounting)
-    })
-    .await
-    {
-        Ok((Ok(()), accounting)) => accounting,
-        Ok((Err(_), accounting)) => {
-            accounting.reject().await;
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Could not record body policy",
-            );
-        }
-        Err(_) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Could not record body policy",
-            );
-        }
-    };
-    if scan.possible_secret {
-        accounting.reject().await;
-        return error(StatusCode::FORBIDDEN, "Body policy rejected request");
-    }
-    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
-        accounting.reject().await;
-        return error(StatusCode::BAD_REQUEST, "Chat messages must be an array");
-    };
-    // Only exact system-content matches are duplicates. Client markers and
-    // metadata cannot stand in for the persisted operator prompt.
-    messages.retain(|message| {
-        !(message.get("role").and_then(Value::as_str) == Some("system")
-            && message.get("content").and_then(Value::as_str) == Some(&job.system_prompt))
-    });
-    messages.insert(0, json!({"role": "system", "content": job.system_prompt}));
-    if body.get("stream") == Some(&Value::Bool(true)) {
-        let options = body
-            .as_object_mut()
-            .unwrap()
-            .entry("stream_options")
-            .or_insert_with(|| json!({}));
-        let Some(options) = options.as_object_mut() else {
-            accounting.reject().await;
-            return error(
-                StatusCode::BAD_REQUEST,
-                "Chat stream_options must be an object",
-            );
+    let mut upstream = state
+        .upstream
+        .request(request.method().clone(), url)
+        .bearer_auth(key);
+    // Model listing has no input tokens or forwarded body, even when a client
+    // supplies a body or content type. It still consumes an admitted request.
+    let reserved = if matches!(kind, usage::UsageKind::Models) {
+        0
+    } else {
+        // Authentication and route checks precede body reads. Reserialization gives
+        // the proxy and upstream identical JSON semantics, including duplicate keys.
+        let mut body = match Json::<Value>::from_request(request, &state).await {
+            Ok(Json(body)) => body,
+            Err(rejection) => {
+                let status = if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                } else {
+                    StatusCode::BAD_REQUEST
+                };
+                accounting.reject().await;
+                return error(status, "Invalid JSON request");
+            }
         };
-        // Ask compatible upstreams for the final cumulative usage report.
-        options.insert("include_usage".to_owned(), Value::Bool(true));
-    }
-
-    let reserved = match budget::constrain(&mut body, job.reserved_tokens) {
-        Ok(reserved) => reserved,
-        Err(failure) => {
+        if !body.is_object()
+            || (matches!(kind, usage::UsageKind::Chat)
+                && body
+                    .get("stream")
+                    .is_some_and(|stream| !stream.is_boolean()))
+        {
             accounting.reject().await;
-            return match failure {
-                budget::BudgetError::Invalid => error(
-                    StatusCode::BAD_REQUEST,
-                    "Invalid chat token limit or choice count",
-                ),
-                budget::BudgetError::Unsupported => error(
-                    StatusCode::BAD_REQUEST,
-                    "Token budgets require text-only chat",
-                ),
-                budget::BudgetError::Insufficient => token_limited(),
-            };
+            return error(StatusCode::BAD_REQUEST, "Chat stream must be a boolean");
         }
+        // Scan client data before authoritative prompt injection. The durable audit
+        // contains only fixed verdicts, never matching text or configured patterns.
+        let scan = state.body_policy.scan(&body);
+        let store = state.store.clone();
+        accounting = match tokio::task::spawn_blocking(move || {
+            let result = store.record_body_policy(
+                job.request_id,
+                scan.possible_secret,
+                scan.prompt_injection,
+            );
+            (result, accounting)
+        })
+        .await
+        {
+            Ok((Ok(()), accounting)) => accounting,
+            Ok((Err(_), accounting)) => {
+                accounting.reject().await;
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Could not record body policy",
+                );
+            }
+            Err(_) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Could not record body policy",
+                );
+            }
+        };
+        if scan.possible_secret {
+            accounting.reject().await;
+            return error(StatusCode::FORBIDDEN, "Body policy rejected request");
+        }
+        if matches!(kind, usage::UsageKind::Chat) {
+            let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+                accounting.reject().await;
+                return error(StatusCode::BAD_REQUEST, "Chat messages must be an array");
+            };
+            // Only exact system-content matches are duplicates. Client markers and
+            // metadata cannot stand in for the persisted operator prompt.
+            messages.retain(|message| {
+                !(message.get("role").and_then(Value::as_str) == Some("system")
+                    && message.get("content").and_then(Value::as_str) == Some(&job.system_prompt))
+            });
+            messages.insert(0, json!({"role": "system", "content": job.system_prompt}));
+            if body.get("stream") == Some(&Value::Bool(true)) {
+                let options = body
+                    .as_object_mut()
+                    .unwrap()
+                    .entry("stream_options")
+                    .or_insert_with(|| json!({}));
+                let Some(options) = options.as_object_mut() else {
+                    accounting.reject().await;
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        "Chat stream_options must be an object",
+                    );
+                };
+                // Ask compatible upstreams for the final cumulative usage report.
+                options.insert("include_usage".to_owned(), Value::Bool(true));
+            }
+        }
+
+        let budget = match kind {
+            usage::UsageKind::Chat => budget::constrain(&mut body, job.reserved_tokens),
+            usage::UsageKind::Embeddings => budget::embeddings(&body, job.reserved_tokens),
+            usage::UsageKind::Models => unreachable!(),
+        };
+        let reserved = match budget {
+            Ok(reserved) => reserved,
+            Err(failure) => {
+                accounting.reject().await;
+                return match failure {
+                    budget::BudgetError::Invalid => error(
+                        StatusCode::BAD_REQUEST,
+                        "Invalid endpoint input or token options",
+                    ),
+                    budget::BudgetError::Unsupported => error(
+                        StatusCode::BAD_REQUEST,
+                        "Token budgets require text-only chat",
+                    ),
+                    budget::BudgetError::Insufficient => token_limited(),
+                };
+            }
+        };
+        upstream = upstream.json(&body);
+        reserved
     };
     let store = state.store.clone();
     // A cancelled waiter cannot drop its permit or refund escrow while this
@@ -381,10 +410,11 @@ async fn admitted_chat(
 
     // Start a fresh request: no client credentials, cookies, routing headers,
     // or hop-by-hop headers cross the upstream trust boundary.
-    accounting.dispatched();
+    accounting.dispatched(kind);
     streaming::forward(
-        state.upstream.post(url).bearer_auth(key).json(&body),
+        upstream,
         accounting,
+        kind,
         deadline,
         Duration::from_secs(state.config.first_byte_timeout_seconds),
         Duration::from_secs(state.config.idle_timeout_seconds),
