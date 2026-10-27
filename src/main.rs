@@ -4,8 +4,30 @@ use rustgate::{config::Config, runtime, service, store::Store};
 use tokio::net::TcpListener;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => {
+            eprintln!("{}", serde_json::json!({"event":"stopped"}));
+            std::process::ExitCode::SUCCESS
+        }
+        Err(_) => {
+            // Dependency errors may contain URLs, credentials or stored content.
+            eprintln!(
+                "{}",
+                serde_json::json!({"event":"failure", "message":"Service failed; inspect the last startup phase and operator runbook"})
+            );
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> anyhow::Result<()> {
+    eprintln!(
+        "{}",
+        serde_json::json!({"event":"startup", "phase":"configuration"})
+    );
     let config = Config::load()?;
+    eprintln!("{}", serde_json::json!({"event":"startup", "phase":"tls"}));
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| anyhow::anyhow!("could not initialize TLS cryptography"))?;
@@ -13,14 +35,26 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|_| anyhow::anyhow!("could not load TLS certificate and private key"))?;
     let database_path = config.database_path.clone();
+    eprintln!(
+        "{}",
+        serde_json::json!({"event":"startup", "phase":"database"})
+    );
     let store = tokio::task::spawn_blocking(move || Store::open_exclusive(&database_path))
         .await
         .context("database startup task failed")??;
+    eprintln!(
+        "{}",
+        serde_json::json!({"event":"startup", "phase":"listener"})
+    );
     let listener = TcpListener::bind(config.listen_addr)
         .await
         .context("could not bind service listener")?;
-    eprintln!("rustgate listening on https://{}", listener.local_addr()?);
-    runtime::serve_tls(listener, service::router(config, store)?, tls)
+    let app = service::router(config, store)?;
+    eprintln!(
+        "{}",
+        serde_json::json!({"event":"listening", "address":listener.local_addr()?.to_string()})
+    );
+    runtime::serve_tls(listener, app, tls)
         .await
         .context("service failed")
 }

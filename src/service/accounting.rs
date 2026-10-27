@@ -2,7 +2,7 @@ use tokio::sync::OwnedSemaphorePermit;
 
 use crate::store::{Store, Usage};
 
-use super::usage::UsageKind;
+use super::{telemetry::Observation, usage::UsageKind};
 
 /// Owns admission until durable reconciliation, including abandoned blocking
 /// admissions and futures cancelled before a response body exists.
@@ -18,20 +18,29 @@ struct Pending {
     usage_final: bool,
     usage_kind: UsageKind,
     _permit: OwnedSemaphorePermit,
+    observation: Option<Observation>,
+    dispatched: bool,
 }
 
 impl Drop for Pending {
     fn drop(&mut self) {
         // Normally dropped on a blocking worker. If shutdown discards that
         // worker's closure, reconcile during teardown instead of losing usage.
-        if self
+        let persisted = self
             .store
             .finish_request(self.request_id, self.outcome, self.usage, self.usage_final)
-            .is_err()
-        {
-            // Leave the pending row recoverable at startup. Never log database
-            // errors, which can contain prompts or other sensitive values.
-            eprintln!("Request accounting persistence failed; startup recovery required");
+            .is_ok();
+        if let Some(observation) = &self.observation {
+            observation.usage(self.outcome, self.usage, self.usage_final);
+            observation.update(serde_json::json!({"accounting_persisted":persisted}));
+            if self.dispatched && self.outcome != "completed" {
+                observation.upstream_failed();
+            }
+        }
+        if !persisted {
+            super::telemetry::event(serde_json::json!({
+                "event":"accounting_failure", "message":"Startup recovery required"
+            }));
         }
     }
 }
@@ -52,13 +61,33 @@ impl Accounting {
                 usage_final: true,
                 usage_kind: UsageKind::Chat,
                 _permit: permit,
+                observation: None,
+                dispatched: false,
             }),
+        }
+    }
+
+    pub(super) fn observe(&mut self, observation: Observation) {
+        self.pending.as_mut().unwrap().observation = Some(observation);
+    }
+
+    pub(super) fn policy(&self, blocked: bool, prompt_injection: bool) {
+        if let Some(observation) = &self.pending.as_ref().unwrap().observation {
+            observation.update(serde_json::json!({
+                "policy_verdict": if blocked { "blocked" } else { "allowed" },
+                "block_reason": blocked.then_some("possible_secret"),
+                "prompt_injection": prompt_injection,
+            }));
         }
     }
 
     pub(super) fn dispatched(&mut self, usage_kind: UsageKind) {
         let pending = self.pending.as_mut().unwrap();
         pending.usage_kind = usage_kind;
+        pending.dispatched = true;
+        if let Some(observation) = &pending.observation {
+            observation.dispatched();
+        }
         if !matches!(usage_kind, UsageKind::Models) {
             pending.usage = None;
             pending.usage_final = false;

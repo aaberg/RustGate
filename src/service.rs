@@ -36,6 +36,7 @@ mod accounting;
 mod budget;
 mod policy;
 mod streaming;
+mod telemetry;
 mod usage;
 
 const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -47,6 +48,7 @@ struct ServiceState {
     upstream: reqwest::Client,
     in_flight: Arc<Semaphore>,
     body_policy: policy::BodyPolicy,
+    metrics: Arc<telemetry::Metrics>,
 }
 
 #[derive(Serialize)]
@@ -91,11 +93,14 @@ pub fn router(config: Config, store: Store) -> anyhow::Result<Router> {
         store,
         upstream,
         body_policy,
+        metrics: Arc::new(telemetry::Metrics::default()),
     });
     let control = Router::new()
         .route("/v1/jobs", post(issue_job))
         .route("/v1/jobs/{job_id}/revoke", post(revoke_job))
         .route("/v1/jobs/{job_id}/done", post(finish_job))
+        .route("/metrics", get(metrics))
+        .route("/v1/usage", get(key_usage))
         // Authentication wraps extraction, so unauthenticated bodies are never parsed.
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
@@ -105,7 +110,40 @@ pub fn router(config: Config, store: Store) -> anyhow::Result<Router> {
         .fallback(proxy)
         .method_not_allowed_fallback(proxy)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            telemetry::observe,
+        ))
         .with_state(state))
+}
+
+async fn metrics(State(state): State<Arc<ServiceState>>) -> Response {
+    let store = state.store.clone();
+    match tokio::task::spawn_blocking(move || store.operational_snapshot()).await {
+        Ok(Ok(snapshot)) => (
+            [(
+                header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )],
+            telemetry::render(&state, snapshot),
+        )
+            .into_response(),
+        _ => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not read operational usage",
+        ),
+    }
+}
+
+async fn key_usage(State(state): State<Arc<ServiceState>>) -> Response {
+    let store = state.store.clone();
+    match tokio::task::spawn_blocking(move || store.operational_snapshot()).await {
+        Ok(Ok(snapshot)) => Json(snapshot).into_response(),
+        _ => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not read operational usage",
+        ),
+    }
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -215,10 +253,19 @@ async fn admitted_proxy(
     let store = state.store.clone();
     // Blocking work outlives a cancelled waiter. Keep its capacity charged until
     // admission actually finishes, then transfer the permit back to the request.
+    let observation = request
+        .extensions()
+        .get::<telemetry::Observation>()
+        .cloned();
     let (job, mut accounting) = match tokio::task::spawn_blocking(move || {
         let admission = store.admit_job(token_hash);
         let accounting = if let Ok(JobAdmission::Admitted(job)) = &admission {
-            Some(accounting::Accounting::new(store, job.request_id, permit))
+            let mut accounting = accounting::Accounting::new(store, job.request_id, permit);
+            if let Some(observation) = observation {
+                observation.admitted(job);
+                accounting.observe(observation);
+            }
+            Some(accounting)
         } else {
             None
         };
@@ -330,6 +377,7 @@ async fn admitted_proxy(
                 );
             }
         };
+        accounting.policy(scan.possible_secret, scan.prompt_injection);
         if scan.possible_secret {
             accounting.reject().await;
             return error(StatusCode::FORBIDDEN, "Body policy rejected request");
@@ -605,6 +653,7 @@ mod tests {
     use super::*;
 
     mod lifecycle_tests;
+    mod operational_tests;
     mod proxy_tests;
     mod streaming_tests;
 
