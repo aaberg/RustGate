@@ -21,3 +21,12 @@ idle_timeout_seconds = 120
 overall_timeout_seconds = 600
 # Process-local admission capacity (1..=65536); saturation returns 503.
 max_in_flight_requests = 64
+
+# Optional regex arrays replace defaults; [] disables that scan.
+# Environment overrides are JSON string arrays:
+# RUSTGATE_SECRET_SCAN_PATTERNS / RUSTGATE_PROMPT_INJECTION_PATTERNS.
+# Defaults block common sk- keys and long base64-like runs; advisory phrases
+# (reveal your system prompt / print your environment / include the API key)
+# are recorded without blocking. See DESIGN.md for limitations and audit fields.
+# secret_scan_patterns = ['sk-[A-Za-z0-9_-]{20,}']
+# prompt_injection_patterns = ['(?i)reveal\s+your\s+system\s+prompt']
