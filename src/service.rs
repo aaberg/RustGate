@@ -286,11 +286,17 @@ async fn admitted_proxy(
                 return error(status, "Invalid JSON request");
             }
         };
-        if !body.is_object()
-            || (matches!(kind, usage::UsageKind::Chat)
-                && body
-                    .get("stream")
-                    .is_some_and(|stream| !stream.is_boolean()))
+        if !body.is_object() {
+            accounting.reject().await;
+            return error(
+                StatusCode::BAD_REQUEST,
+                "Request body must be a JSON object",
+            );
+        }
+        if matches!(kind, usage::UsageKind::Chat)
+            && body
+                .get("stream")
+                .is_some_and(|stream| !stream.is_boolean())
         {
             accounting.reject().await;
             return error(StatusCode::BAD_REQUEST, "Chat stream must be a boolean");
