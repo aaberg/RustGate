@@ -5,6 +5,14 @@ use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--version" || arg == "-V")
+    {
+        println!("rustgate {}", env!("CARGO_PKG_VERSION"));
+        return std::process::ExitCode::SUCCESS;
+    }
+
     match run().await {
         Ok(()) => {
             eprintln!("{}", serde_json::json!({"event":"stopped"}));

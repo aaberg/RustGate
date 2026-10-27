@@ -600,6 +600,29 @@ Run `opencode run --model rustgate/mock-mistral "Say hello. Do not use tools."`,
 If OpenCode reports `OpenAI Chat stream ended without finish_reason`, first rebuild/restart the mock and remove any forced `mode=normal` or `mode=sse` query option. Before this compatibility fix, a request with `"stream": true` but no mode query received JSON; the corrected mock selects SSE from the body. Keep the proxy's real stream errors visible rather than synthesizing a finish reason. OpenCode may retry failed generations; RustGate itself does not retry, and each admitted client retry consumes another request slot.
 
 
+### CI and GitHub releases
+
+`.github/workflows/ci.yml` builds both executables and runs all-target tests in the release profile on every push, pull request, and published GitHub Release, including prereleases. Cargo uses `--locked`; commit `Cargo.lock` updates alongside dependency or package-version changes. The target is Linux x86-64 (`x86_64-unknown-linux-gnu`) on Ubuntu 24.04 with stable Rust. These are glibc-based executables, not static musl builds; use a compatible deployment host.
+
+Every successful run preserves a CI artifact containing only the production `rustgate` executable in `rustgate-v<version>-x86_64-unknown-linux-gnu.tar.gz`, plus `SHA256SUMS`. `mock-upstream` is built and tested but is not distributed. Publishing a GitHub Release additionally uploads those same files to that release after the build, tests, and executable-version smoke check pass. A tag push alone does not upload release assets. The upload job alone receives `contents: write` through GitHub's built-in token; no separate deployment secret is required. Re-running the workflow replaces same-named release assets.
+
+`Cargo.toml`'s `package.version` is the single source of truth. `rustgate --version` (or `-V`) prints that compile-time version and exits successfully without loading configuration, certificates, or the database. Release tags must be exactly `v<package.version>`; CI rejects a mismatch before building or uploading. SemVer prereleases work the same way, for example package version `1.2.0-rc.1` and tag `v1.2.0-rc.1`. The GitHub Release title is descriptive and does not set the version.
+
+Release procedure:
+
+1. Update `package.version` in `Cargo.toml`, run `cargo check --all-targets` to refresh the root package entry in `Cargo.lock`, and commit both files. Wait for CI to pass for that commit.
+2. Tag that commit with the matching `v<version>` tag and push the tag. Publish a GitHub Release selecting that tag, or publish a prerelease for a prerelease version. Ensure this workflow has reached the repository's default branch before publishing.
+3. Wait for the release workflow to finish, then download the archive and `SHA256SUMS` from that release. Verify before installing:
+
+   ```sh
+   sha256sum --check SHA256SUMS
+   VERSION=0.1.0 # Set to the downloaded release's version, without the v prefix.
+   tar -xzf "rustgate-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+   ./rustgate --version
+   ```
+
+Keep the source tag/revision and checksum in the release inventory described in the deployment runbook. Release automation attaches binaries to GitHub Releases; it does not restart or modify production hosts.
+
 ### Checks
 
 ```sh
