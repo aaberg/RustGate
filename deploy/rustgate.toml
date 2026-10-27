@@ -1,0 +1,25 @@
+# Production baseline. See DESIGN.md, "Production deployment and operations".
+# Fail closed on loopback until the operator selects a firewalled private IP.
+# Never bind 0.0.0.0 or [::] on an internet-accessible host.
+listen_addr = "127.0.0.1:8443"
+upstream_base_url = "https://api.mistral.ai"
+tls_cert_path = "/etc/rustgate/tls/fullchain.pem"
+tls_key_path = "/etc/rustgate/tls/privkey.pem"
+database_path = "/var/lib/rustgate/rustgate.sqlite3"
+# Replace this internal DNS name with the name in your trusted TLS certificate.
+proxy_url = "https://rustgate.internal:8443/v1"
+
+# Credentials deliberately absent. The root-owned systemd EnvironmentFile must
+# supply RUSTGATE_CONTROL_PLANE_TOKEN and RUSTGATE_UPSTREAM_KEYS.
+default_ttl_seconds = 1800
+max_ttl_seconds = 86400
+default_max_requests = 100
+max_requests = 10000
+default_max_tokens_total = 2000000
+max_tokens_total = 100000000
+connect_timeout_seconds = 5
+first_byte_timeout_seconds = 60
+idle_timeout_seconds = 120
+overall_timeout_seconds = 600
+max_in_flight_requests = 64
+# Keep built-in secret-blocking and advisory patterns; arrays replace defaults.

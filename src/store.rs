@@ -36,6 +36,8 @@ pub(crate) struct NewJob {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct AdmittedJob {
     pub request_id: i64,
+    pub job_id: String,
+    pub tenant_id: String,
     pub upstream_key_id: String,
     pub system_prompt: String,
     pub reserved_tokens: i64,
@@ -72,6 +74,42 @@ pub(crate) enum TransitionError {
     NotFound,
     Conflict,
     Storage,
+}
+
+#[derive(Debug, Eq, PartialEq, serde::Serialize)]
+pub(crate) struct OperationalSnapshot {
+    pub keys: Vec<KeyUsage>,
+    pub jobs: Vec<JobUsage>,
+    pub outcomes: Vec<OutcomeCount>,
+    pub blocked: Vec<BlockedCount>,
+}
+
+#[derive(Debug, Eq, PartialEq, serde::Serialize)]
+pub(crate) struct KeyUsage {
+    pub upstream_key_id: String,
+    pub requests_used: i64,
+    pub tokens_used: i64,
+    pub tokens_unreported: i64,
+    pub tokens_reserved: i64,
+}
+
+#[derive(Debug, Eq, PartialEq, serde::Serialize)]
+pub(crate) struct JobUsage {
+    pub job_id: String,
+    pub tenant_id: String,
+    pub requests_used: i64,
+}
+
+#[derive(Debug, Eq, PartialEq, serde::Serialize)]
+pub(crate) struct OutcomeCount {
+    pub outcome: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Eq, PartialEq, serde::Serialize)]
+pub(crate) struct BlockedCount {
+    pub reason: String,
+    pub count: i64,
 }
 
 impl Store {
@@ -262,6 +300,99 @@ impl Store {
                 connection: Mutex::new(connection),
                 _ownership: ownership,
             }),
+        })
+    }
+
+    /// Reads durable, redacted accounting from one consistent SQLite snapshot.
+    /// Key totals come directly from jobs, including keys no longer configured.
+    pub(crate) fn operational_snapshot(&self) -> Result<OperationalSnapshot> {
+        let mut connection = self
+            .inner
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock failed"))?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .context("could not begin operational snapshot")?;
+        let keys = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT upstream_key_id, SUM(requests_used), SUM(tokens_used),
+                            SUM(tokens_unreported), SUM(tokens_reserved)
+                     FROM jobs GROUP BY upstream_key_id ORDER BY upstream_key_id",
+                )
+                .context("could not prepare key usage snapshot")?;
+            statement
+                .query_map([], |row| {
+                    Ok(KeyUsage {
+                        upstream_key_id: row.get(0)?,
+                        requests_used: row.get(1)?,
+                        tokens_used: row.get(2)?,
+                        tokens_unreported: row.get(3)?,
+                        tokens_reserved: row.get(4)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .context("could not read key usage snapshot")?
+        };
+        let jobs = {
+            let mut statement = transaction
+                .prepare("SELECT job_id, tenant_id, requests_used FROM jobs ORDER BY job_id")
+                .context("could not prepare job usage snapshot")?;
+            statement
+                .query_map([], |row| {
+                    Ok(JobUsage {
+                        job_id: row.get(0)?,
+                        tenant_id: row.get(1)?,
+                        requests_used: row.get(2)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .context("could not read job usage snapshot")?
+        };
+        let outcomes = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT outcome, COUNT(*) FROM request_records
+                     GROUP BY outcome ORDER BY outcome",
+                )
+                .context("could not prepare outcome snapshot")?;
+            statement
+                .query_map([], |row| {
+                    Ok(OutcomeCount {
+                        outcome: row.get(0)?,
+                        count: row.get(1)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .context("could not read outcome snapshot")?
+        };
+        let blocked = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT block_reason, COUNT(*) FROM request_records
+                     WHERE policy_verdict = 'blocked'
+                     GROUP BY block_reason ORDER BY block_reason",
+                )
+                .context("could not prepare blocked request snapshot")?;
+            statement
+                .query_map([], |row| {
+                    Ok(BlockedCount {
+                        reason: row.get(0)?,
+                        count: row.get(1)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .context("could not read blocked request snapshot")?
+        };
+        transaction
+            .commit()
+            .context("could not commit operational snapshot")?;
+        Ok(OperationalSnapshot {
+            keys,
+            jobs,
+            outcomes,
+            blocked,
         })
     }
 
@@ -648,7 +779,8 @@ fn admit_job_in_transaction(
     let job = transaction
         .query_row(
             "SELECT job_id, upstream_key_id, system_prompt, status, requests_used,
-                    max_requests, max_tokens_total, tokens_used, tokens_unreported, tokens_reserved
+                    max_requests, max_tokens_total, tokens_used, tokens_unreported, tokens_reserved,
+                    tenant_id
              FROM jobs WHERE token_hash = ?1",
             params![token_hash.as_slice()],
             |row| {
@@ -663,6 +795,7 @@ fn admit_job_in_transaction(
                     row.get::<_, i64>(7)?,
                     row.get::<_, i64>(8)?,
                     row.get::<_, i64>(9)?,
+                    row.get::<_, String>(10)?,
                 ))
             },
         )
@@ -679,6 +812,7 @@ fn admit_job_in_transaction(
         used,
         unreported,
         reserved,
+        tenant_id,
     )) = job
     else {
         return Ok(JobAdmission::Unauthorized);
@@ -736,6 +870,8 @@ fn admit_job_in_transaction(
     ).context("could not record job admission")?;
     Ok(JobAdmission::Admitted(AdmittedJob {
         request_id: transaction.last_insert_rowid(),
+        job_id,
+        tenant_id,
         upstream_key_id,
         system_prompt,
         reserved_tokens: available,
@@ -772,6 +908,152 @@ mod tests {
                 })
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn operational_snapshot_of_an_empty_store_is_empty() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("jobs.sqlite3")).unwrap();
+        assert_eq!(
+            serde_json::to_value(store.operational_snapshot().unwrap()).unwrap(),
+            serde_json::json!({
+                "keys": [],
+                "jobs": [],
+                "outcomes": [],
+                "blocked": [],
+            })
+        );
+    }
+
+    #[test]
+    fn operational_snapshot_aggregates_jobs_without_join_duplication_and_survives_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite3");
+        let store = Store::open(&path).unwrap();
+        // Deliberately insert out of order, with shared keys across tenants and an idle job.
+        for (job_id, tenant_id, upstream_key_id, token) in [
+            ("job-c", "tenant-a", "removed-key", 3),
+            ("job-b", "tenant-b", "shared-key", 2),
+            ("job-d", "tenant-c", "idle-key", 4),
+            ("job-a", "tenant-a", "shared-key", 1),
+        ] {
+            assert!(
+                store
+                    .insert_job(NewJob {
+                        job_id: job_id.to_owned(),
+                        tenant_id: tenant_id.to_owned(),
+                        upstream_key_id: upstream_key_id.to_owned(),
+                        system_prompt: "private system prompt never exported".to_owned(),
+                        token_hash: [token; 32],
+                        created_at: 1,
+                        expires_at: i64::MAX,
+                        max_requests: 10,
+                        max_tokens_total: 1_000,
+                    })
+                    .is_ok()
+            );
+        }
+        for (token, reservation, outcome, known, usage_final, blocked) in [
+            (1, 20, "completed", Some(10), true, false),
+            (1, 12, "timeout", Some(4), false, false),
+            (2, 20, "upstream_error", None, false, false),
+            (2, 0, "rejected", Some(0), true, true),
+            (2, 10, "completed", Some(3), true, false),
+            (3, 10, "completed", Some(5), true, false),
+        ] {
+            let JobAdmission::Admitted(admitted) = store.admit_job([token; 32]).unwrap() else {
+                panic!("expected admission");
+            };
+            let (job_id, tenant_id) = match token {
+                1 => ("job-a", "tenant-a"),
+                2 => ("job-b", "tenant-b"),
+                3 => ("job-c", "tenant-a"),
+                _ => unreachable!(),
+            };
+            assert_eq!(admitted.job_id, job_id);
+            assert_eq!(admitted.tenant_id, tenant_id);
+            store
+                .constrain_reservation(admitted.request_id, reservation)
+                .unwrap();
+            // An allowed prompt-injection finding must not count as a block.
+            store
+                .record_body_policy(admitted.request_id, blocked, true)
+                .unwrap();
+            store
+                .finish_request(
+                    admitted.request_id,
+                    outcome,
+                    known.map(|total| Usage {
+                        prompt_tokens: total,
+                        completion_tokens: 0,
+                        total_tokens: total,
+                    }),
+                    usage_final,
+                )
+                .unwrap();
+        }
+        for (token, reservation) in [(1, 7), (3, 11)] {
+            let request_id = admitted_request(&store, token);
+            store
+                .constrain_reservation(request_id, reservation)
+                .unwrap();
+        }
+        store.transition_job("job-c", JobTransition::Done).unwrap();
+
+        let before = store.operational_snapshot().unwrap();
+        let mut expected = serde_json::json!({
+            "keys": [
+                {
+                    "upstream_key_id": "idle-key", "requests_used": 0,
+                    "tokens_used": 0, "tokens_unreported": 0, "tokens_reserved": 0
+                },
+                {
+                    "upstream_key_id": "removed-key", "requests_used": 2,
+                    "tokens_used": 5, "tokens_unreported": 0, "tokens_reserved": 11
+                },
+                {
+                    "upstream_key_id": "shared-key", "requests_used": 6,
+                    "tokens_used": 17, "tokens_unreported": 28, "tokens_reserved": 7
+                }
+            ],
+            "jobs": [
+                {"job_id": "job-a", "tenant_id": "tenant-a", "requests_used": 3},
+                {"job_id": "job-b", "tenant_id": "tenant-b", "requests_used": 3},
+                {"job_id": "job-c", "tenant_id": "tenant-a", "requests_used": 2},
+                {"job_id": "job-d", "tenant_id": "tenant-c", "requests_used": 0}
+            ],
+            "outcomes": [
+                {"outcome": "completed", "count": 3},
+                {"outcome": "pending", "count": 2},
+                {"outcome": "rejected", "count": 1},
+                {"outcome": "timeout", "count": 1},
+                {"outcome": "upstream_error", "count": 1}
+            ],
+            "blocked": [{"reason": "possible_secret", "count": 1}]
+        });
+        // Exact serialized shape excludes hashes, system prompts, and raw credentials.
+        assert_eq!(serde_json::to_value(&before).unwrap(), expected);
+        assert_eq!(store.operational_snapshot().unwrap(), before);
+        drop(store);
+
+        expected["keys"][1]["tokens_unreported"] = serde_json::json!(11);
+        expected["keys"][1]["tokens_reserved"] = serde_json::json!(0);
+        expected["keys"][2]["tokens_unreported"] = serde_json::json!(35);
+        expected["keys"][2]["tokens_reserved"] = serde_json::json!(0);
+        expected["outcomes"] = serde_json::json!([
+            {"outcome": "completed", "count": 3},
+            {"outcome": "interrupted", "count": 2},
+            {"outcome": "rejected", "count": 1},
+            {"outcome": "timeout", "count": 1},
+            {"outcome": "upstream_error", "count": 1}
+        ]);
+        for _ in 0..2 {
+            let reopened = Store::open(&path).unwrap();
+            let after = reopened.operational_snapshot().unwrap();
+            assert_eq!(after.jobs, before.jobs);
+            assert_eq!(after.blocked, before.blocked);
+            assert_eq!(serde_json::to_value(after).unwrap(), expected);
+        }
     }
 
     #[test]
@@ -992,6 +1274,8 @@ mod tests {
             admit_job_in_transaction(&transaction, [3; 32], 1_000).unwrap(),
             JobAdmission::Admitted(AdmittedJob {
                 request_id: 1,
+                job_id: "after".to_owned(),
+                tenant_id: "tenant".to_owned(),
                 upstream_key_id: "upstream".to_owned(),
                 system_prompt: "system".to_owned(),
                 reserved_tokens: 1_000,
@@ -1027,6 +1311,8 @@ mod tests {
             store.admit_job([3; 32]).unwrap(),
             JobAdmission::Admitted(AdmittedJob {
                 request_id: 1,
+                job_id: "future".to_owned(),
+                tenant_id: "tenant".to_owned(),
                 upstream_key_id: "upstream".to_owned(),
                 system_prompt: "system".to_owned(),
                 reserved_tokens: 1_000,
@@ -1397,6 +1683,8 @@ mod tests {
             admitted,
             JobAdmission::Admitted(AdmittedJob {
                 request_id: 1,
+                job_id: "job".to_owned(),
+                tenant_id: "tenant".to_owned(),
                 upstream_key_id: "chosen-key".to_owned(),
                 system_prompt: "chosen system prompt".to_owned(),
                 reserved_tokens: 1_000,

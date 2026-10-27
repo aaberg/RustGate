@@ -24,6 +24,7 @@ pub async fn serve_tls(
     tokio::select! {
         result = &mut server => result,
         _ = shutdown => {
+            eprintln!("{}", serde_json::json!({"event":"shutdown", "message":"Draining admitted requests"}));
             handle.graceful_shutdown(None);
             server.await
         }
@@ -47,8 +48,11 @@ fn shutdown_signal() -> std::io::Result<impl Future<Output = ()> + Send + 'stati
 
     #[cfg(not(unix))]
     let shutdown = async {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            eprintln!("shutdown signal failed: {error}");
+        if tokio::signal::ctrl_c().await.is_err() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"event":"failure", "message":"Shutdown signal failed"})
+            );
         }
     };
 

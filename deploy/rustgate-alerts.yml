@@ -1,0 +1,51 @@
+# Starting thresholds for deploy/rustgate.toml (64 slots, 600s overall timeout).
+# Tune for workload; counters are tokens/attempts, never money.
+groups:
+  - name: rustgate
+    rules:
+      - alert: RustGateUnavailable
+        expr: up{job="rustgate"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: RustGate authenticated HTTPS scrape is failing
+          description: Check service state, certificate trust/expiry, bearer rotation, network policy and SQLite availability.
+      - alert: RustGateUpstreamErrors
+        expr: (sum by (instance) (rate(rustgate_upstream_errors_total[5m])) / clamp_min(sum by (instance) (rate(rustgate_upstream_requests_total[5m])), 0.001) > 0.05) and (sum by (instance) (rate(rustgate_upstream_requests_total[5m])) > 0.1)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: RustGate upstream failure ratio exceeds five percent
+          description: Includes non-success responses and uncertain transport/timeout/disconnect outcomes; investigate without logging bodies or credentials.
+      - alert: RustGateCapacityPressure
+        expr: rustgate_in_flight_requests > 48
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: RustGate is using over three quarters of its configured 64 slots
+          description: Inspect upstream latency and SQLite contention before increasing concurrency; blocking accounting workers retain slots.
+      - alert: RustGateUnreportedUsage
+        expr: increase(rustgate_key_tokens_unreported_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: RustGate retained uncertain token consumption
+          description: Inspect upstream usage compatibility, interrupted work and timeout rates. Do not refund unreported spending automatically.
+      - alert: RustGateReservationsStalled
+        expr: rustgate_key_tokens_reserved > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: RustGate key has continuously outstanding reservations
+          description: May be normal sustained traffic; if idle, investigate stuck uploads, streams or SQLite workers. Never delete the ownership lock to clear it.
+      - alert: RustGateSecretPolicyBlocks
+        expr: increase(rustgate_blocked_requests_total{reason="possible_secret"}[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: RustGate blocked a possible secret in client JSON
+          description: Investigate the responsible job through restricted operator tooling, without collecting matched text, bodies or regexes.

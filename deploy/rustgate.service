@@ -1,0 +1,53 @@
+[Unit]
+Description=RustGate job-scoped LLM proxy
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=rustgate
+Group=rustgate
+Environment=RUSTGATE_CONFIG=/etc/rustgate/rustgate.toml
+EnvironmentFile=/etc/rustgate/rustgate.env
+ExecStart=/usr/local/bin/rustgate
+WorkingDirectory=/var/lib/rustgate
+StateDirectory=rustgate
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+# The application drains admitted requests and SQLite workers without a deadline.
+# Do not let systemd turn an ordinary stop/upgrade into accounting uncertainty.
+TimeoutStopSec=infinity
+SendSIGKILL=no
+LimitNOFILE=8192
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rustgate
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+# StateDirectory remains writable under ProtectSystem=strict. The binary,
+# configuration, environment file and TLS files must be root-owned/read-only.
+# Network egress restrictions MUST be installed separately; see DESIGN.md.
+
+[Install]
+WantedBy=multi-user.target
