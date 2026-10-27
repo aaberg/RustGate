@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'release' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  build:
+    name: Build and test (Linux x86-64)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read version and validate release tag
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+
+          with open("Cargo.toml", "rb") as manifest:
+              version = tomllib.load(manifest)["package"]["version"]
+          expected_tag = f"v{version}"
+          if os.environ["EVENT_NAME"] == "release":
+              tag = os.environ["RELEASE_TAG"]
+              if tag != expected_tag:
+                  raise SystemExit(f"Release tag {tag!r} must match Cargo.toml: {expected_tag!r}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"version={version}\n")
+          PY
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Build executables
+        run: cargo +stable build --locked --release --bins --target "$TARGET"
+
+      - name: Test all targets
+        run: cargo +stable test --locked --release --all-targets --target "$TARGET"
+
+      - name: Check executable version without service configuration
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: test "$(target/"$TARGET"/release/rustgate --version)" = "rustgate $VERSION"
+
+      - name: Package production executable
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          archive="rustgate-v${VERSION}-${TARGET}.tar.gz"
+          mkdir -p dist
+          tar -C "target/$TARGET/release" -czf "dist/$archive" rustgate
+          (cd dist && sha256sum "$archive" > SHA256SUMS)
+
+      - name: Preserve tested artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rustgate-linux-x86_64
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    name: Upload GitHub Release assets
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download tested artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rustgate-linux-x86_64
+          path: dist
+
+      - name: Upload executable archive and checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" dist/* --repo "$GH_REPO" --clobber
