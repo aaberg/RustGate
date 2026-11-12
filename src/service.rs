@@ -3,7 +3,6 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::Context;
 use axum::{
     Json, Router,
     extract::{
@@ -76,16 +75,37 @@ struct IssuedJob<'a> {
     proxy_url: &'a str,
 }
 
-pub fn router(config: Config, store: Store) -> anyhow::Result<Router> {
-    let body_policy = policy::BodyPolicy::new(&config)?;
-    let upstream = reqwest::Client::builder()
+fn upstream_client(
+    config: &Config,
+    read_file: impl FnOnce(&std::path::Path) -> std::io::Result<Vec<u8>>,
+) -> anyhow::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
         .connect_timeout(Duration::from_secs(config.connect_timeout_seconds))
         // Egress is selected only by configuration, never environment proxies.
-        .no_proxy()
+        .no_proxy();
+    if let Some(path) = &config.upstream_ca_cert_path {
+        let pem = read_file(path)
+            .map_err(|_| anyhow::anyhow!("could not read upstream CA certificate bundle"))?;
+        let certificates = reqwest::Certificate::from_pem_bundle(&pem)
+            .map_err(|_| anyhow::anyhow!("invalid upstream CA certificate bundle"))?;
+        if certificates.is_empty() {
+            anyhow::bail!("invalid upstream CA certificate bundle: no certificates");
+        }
+        // Add to the default roots; retain certificate and hostname verification.
+        for certificate in certificates {
+            builder = builder.add_root_certificate(certificate);
+        }
+    }
+    builder
         .build()
-        .context("could not initialize upstream HTTP client")?;
+        .map_err(|_| anyhow::anyhow!("could not initialize upstream HTTP client"))
+}
+
+pub fn router(config: Config, store: Store) -> anyhow::Result<Router> {
+    let body_policy = policy::BodyPolicy::new(&config)?;
+    let upstream = upstream_client(&config, |path| std::fs::read(path))?;
     let state = Arc::new(ServiceState {
         control_token_hash: Sha256::digest(config.control_plane_token.as_bytes()).into(),
         in_flight: Arc::new(Semaphore::new(config.max_in_flight_requests as usize)),
@@ -672,6 +692,7 @@ mod tests {
         Config {
             listen_addr: "127.0.0.1:8443".parse().unwrap(),
             upstream_base_url: "http://127.0.0.1:9090".parse().unwrap(),
+            upstream_ca_cert_path: None,
             tls_cert_path: PathBuf::from("unused-test-cert.pem"),
             tls_key_path: PathBuf::from("unused-test-key.pem"),
             database_path: path,
@@ -713,6 +734,52 @@ mod tests {
                 .query_row("SELECT count(*) FROM jobs", [], |row| row.get(0))
                 .unwrap()
         }
+    }
+
+    #[test]
+    fn upstream_ca_bundle_fails_closed_with_redacted_errors() {
+        let mut config = config(PathBuf::from("unused.sqlite3"));
+        config.upstream_ca_cert_path = Some(PathBuf::from("private-ca-path"));
+        let error = upstream_client(&config, |_| {
+            Err(std::io::Error::other("private-read-error"))
+        })
+        .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "could not read upstream CA certificate bundle"
+        );
+        for bundle in [
+            "",
+            "private-malformed",
+            "-----BEGIN CERTIFICATE-----\nprivate-invalid-base64\n-----END CERTIFICATE-----",
+            "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----",
+        ] {
+            let mut reads = 0;
+            let error = upstream_client(&config, |path| {
+                assert_eq!(path, std::path::Path::new("private-ca-path"));
+                reads += 1;
+                Ok(bundle.as_bytes().to_vec())
+            })
+            .unwrap_err();
+            assert_eq!(reads, 1);
+            let message = format!("{error:#}");
+            assert!(!message.contains("private"), "{message}");
+            assert!(
+                message.starts_with("invalid upstream CA certificate bundle")
+                    || message == "could not initialize upstream HTTP client",
+                "{message}",
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_ca_bundle_is_not_read_when_unconfigured() {
+        assert!(
+            upstream_client(&config(PathBuf::from("unused.sqlite3")), |_| {
+                panic!("unconfigured CA file must not be read")
+            })
+            .is_ok()
+        );
     }
 
     fn valid_body() -> Value {

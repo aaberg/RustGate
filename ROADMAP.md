@@ -66,6 +66,8 @@ Step 12 verification: all 177 regression tests passed; Clippy passed with warnin
 Final compatibility checks: the compiled HTTPS `/v1/usage` returned all four documented snapshot arrays with unchanged durable totals. The Prometheus Python parser accepted 13 unique typed metric families after checking contiguous metadata/sample grouping; process upstream counters reset to zero after restart. Both monitoring YAML files parsed and all six alert expressions passed a PromQL parser. `systemd-analyze verify` accepted a temporary copy of the unit with `ExecStart` redirected to the compiled staging binary (the production installation path is absent here). These are syntax/protocol checks, not a live systemd deployment or production firewall/backup acceptance.
 
 
+Container packaging verification: both Linux amd64 runtime targets built in Docker image format with rootless Podman. The container smoke scenario passed trusted HTTPS health, JSON, incremental SSE, credential replacement and prompt injection, persistent accounting/job tokens, SIGTERM draining, trusted private-CA upstream access, and rejection of an untrusted upstream certificate. The actual Compose deployment reached healthy status for both services and proxied an issued job to the loopback mock on an SELinux-enforcing host. All 19 configuration tests and 3 upstream-CA tests passed. Actionlint, workflow shell syntax, and stable/prerelease/build-metadata tag mapping passed. GHCR publication is configured for releases; no registry push was performed locally.
+
 ## Release checkpoints
 
 - **After step 5:** useful local integration slice; not ready for build containers because quotas and streaming guarantees are incomplete.
