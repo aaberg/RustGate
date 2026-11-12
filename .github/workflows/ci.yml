@@ -21,10 +21,16 @@ jobs:
   build:
     name: Build and test (Linux x86-64)
     runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      container_tag: ${{ steps.version.outputs.container_tag }}
+      publish_latest: ${{ steps.version.outputs.publish_latest }}
+      commit: ${{ github.sha }}
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Read version and validate release tag
@@ -35,17 +41,26 @@ jobs:
         run: |
           python3 - <<'PY'
           import os
+          import re
           import tomllib
 
           with open("Cargo.toml", "rb") as manifest:
               version = tomllib.load(manifest)["package"]["version"]
+          # Cargo validates SemVer during the build. '+' is legal in SemVer but
+          # not a container tag; '_' is not legal in SemVer, so this is unambiguous.
+          container_tag = f"v{version}".replace("+", "_")
+          if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", container_tag):
+              raise SystemExit("Package version does not fit a container tag")
           expected_tag = f"v{version}"
           if os.environ["EVENT_NAME"] == "release":
               tag = os.environ["RELEASE_TAG"]
               if tag != expected_tag:
                   raise SystemExit(f"Release tag {tag!r} must match Cargo.toml: {expected_tag!r}")
+          prerelease = "-" in version.partition("+")[0]
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write(f"version={version}\n")
+              output.write(f"container_tag={container_tag}\n")
+              output.write(f"publish_latest={str(not prerelease).lower()}\n")
           PY
 
       - name: Install stable Rust
@@ -78,6 +93,119 @@ jobs:
           path: dist/*
           if-no-files-found: error
           compression-level: 0
+
+  images:
+    name: Build and smoke-test container images
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      DOCKER_BUILDKIT: 1
+      VERSION: ${{ needs.build.outputs.version }}
+      REVISION: ${{ needs.build.outputs.commit }}
+      SOURCE: https://github.com/${{ github.repository }}
+    steps:
+      - name: Check out the exact tested event commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.build.outputs.commit }}
+          persist-credentials: false
+
+      - name: Build both runtime targets using the shared local BuildKit cache
+        run: |
+          set -euo pipefail
+          docker build --platform linux/amd64 --target rustgate \
+            --build-arg VERSION="$VERSION" --build-arg REVISION="$REVISION" \
+            --build-arg SOURCE="$SOURCE" --tag rustgate:ci .
+          docker build --platform linux/amd64 --target mock-upstream \
+            --build-arg VERSION="$VERSION" --build-arg REVISION="$REVISION" \
+            --build-arg SOURCE="$SOURCE" --tag rustgate-mock:ci .
+
+      - name: Exercise the actual hardened containers
+        run: python3 scripts/container-smoke.py
+
+      - name: Save both tested images without rebuilding
+        if: github.event_name == 'release'
+        run: |
+          mkdir -p container-dist
+          docker save --output container-dist/tested-images.tar rustgate:ci rustgate-mock:ci
+
+      - name: Preserve the tested release images for publication and retry
+        if: github.event_name == 'release'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rustgate-tested-container-images
+          path: container-dist/tested-images.tar
+          if-no-files-found: error
+          compression-level: 0
+
+  publish-images:
+    name: Publish the tested container images
+    if: github.event_name == 'release'
+    needs: [build, images]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    env:
+      GHCR_TOKEN: ${{ github.token }}
+      GHCR_USER: ${{ github.actor }}
+      REPOSITORY: ${{ github.repository }}
+      VERSION: ${{ needs.build.outputs.version }}
+      CONTAINER_TAG: ${{ needs.build.outputs.container_tag }}
+      REVISION: ${{ needs.build.outputs.commit }}
+      PUBLISH_LATEST: ${{ !github.event.release.prerelease && needs.build.outputs.publish_latest == 'true' }}
+    steps:
+      - name: Download the exact images that passed smoke tests
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rustgate-tested-container-images
+          path: container-dist
+
+      - name: Load tested images
+        run: docker load --input container-dist/tested-images.tar
+
+      - name: Log in to GHCR
+        run: |
+          set +x
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GHCR_USER" --password-stdin
+
+      - name: Tag, push, and summarize both images
+        run: |
+          set -euo pipefail
+          repository="${REPOSITORY,,}"
+          for local_image in rustgate:ci rustgate-mock:ci; do
+            image="ghcr.io/$repository"
+            if [[ "$local_image" == rustgate-mock:ci ]]; then
+              image="$image-mock"
+            fi
+            tags=("$CONTAINER_TAG" "sha-$REVISION")
+            if [[ "$PUBLISH_LATEST" == true ]]; then
+              tags+=(latest)
+            fi
+            for tag in "${tags[@]}"; do
+              docker tag "$local_image" "$image:$tag"
+              # Publication is deliberately fail-fast, not atomic across two images.
+              # Retry this job from the saved tar to reuse these exact tested images.
+              docker push "$image:$tag"
+            done
+            IMAGE="$image" LOCAL_IMAGE="$local_image" python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          image = os.environ["IMAGE"]
+          metadata = json.loads(subprocess.check_output(
+              ["docker", "image", "inspect", os.environ["LOCAL_IMAGE"]], text=True
+          ))[0]
+          digest = next(
+              value for value in metadata["RepoDigests"] if value.startswith(image + "@")
+          )
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(f"### `{image}`\n\nPublished tested image: `{digest}`\n\n")
+          PY
+          done
 
   release:
     name: Upload GitHub Release assets

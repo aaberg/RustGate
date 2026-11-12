@@ -1,0 +1,23 @@
+# Use only with compose.yaml, only with fake credentials.
+name: rustgate-mock
+
+services:
+  rustgate:
+    environment:
+      RUSTGATE_UPSTREAM_BASE_URL: http://127.0.0.1:9090
+
+  mock-upstream:
+    image: ${RUSTGATE_MOCK_IMAGE:-rustgate-mock:local}
+    build:
+      context: ..
+      target: mock-upstream
+    network_mode: service:rustgate
+    depends_on:
+      rustgate:
+        condition: service_healthy
+        restart: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    stop_grace_period: 15s

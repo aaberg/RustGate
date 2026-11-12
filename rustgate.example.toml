@@ -12,7 +12,9 @@ proxy_url = "https://localhost:8443/v1"
 # upstream_keys is a TOML table, or a JSON object in RUSTGATE_UPSTREAM_KEYS.
 # Neither control/upstream credentials nor job tokens belong in this file.
 # Production: root-owned 0600 /etc/rustgate/rustgate.env, loaded by systemd;
-# no *_FILE secret settings or live reload are supported. Restart to rotate.
+# Or use RUSTGATE_CONTROL_PLANE_TOKEN_FILE / RUSTGATE_UPSTREAM_KEYS_FILE.
+# Do not set both a direct secret environment variable and its _FILE variant.
+# All settings load at startup; restart to rotate.
 default_ttl_seconds = 1800
 max_ttl_seconds = 86400
 default_max_requests = 100

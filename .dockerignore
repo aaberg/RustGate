@@ -1,0 +1,8 @@
+# Allowlist: local secrets, TLS keys, SQLite files, Git metadata and target/
+# must never be sent to the builder, even when stored under unexpected names.
+**
+!Dockerfile
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**

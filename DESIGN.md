@@ -146,6 +146,7 @@ Precedence: built-in defaults, optional TOML file selected by `RUSTGATE_CONFIG`,
 | --- | --- |
 | `listen_addr` | `127.0.0.1:8443`; IP socket address |
 | `upstream_base_url` | `http://127.0.0.1:9090`; HTTPS, or HTTP on loopback only |
+| `upstream_ca_cert_path` | Optional PEM CA bundle added to built-in upstream trust roots; TLS/hostname verification remains mandatory |
 | `tls_cert_path`, `tls_key_path` | Required PEM certificate chain and matching private key |
 | `database_path` | `rustgate.sqlite3`; persistent file, not `:memory:` or a `file:` URI |
 | `control_plane_token` | Required; at least 32 visible ASCII bytes without whitespace; generate randomly |
@@ -163,6 +164,8 @@ Precedence: built-in defaults, optional TOML file selected by `RUSTGATE_CONFIG`,
 | `prompt_injection_patterns` | Regex string array; default case-insensitive advisory phrases described below |
 
 Defaults must be positive and not exceed their maxima; all maxima must fit a signed SQLite integer. Upstream URLs cannot include credentials, query strings, or fragments. Key credentials must be nonempty visible ASCII without whitespace. Mount secret configuration read-only with restrictive permissions, or supply environment variables; neither key-pool credentials nor the control credential are persisted in SQLite. Keys are loaded at startup; restart to change the pool.
+
+Mounted secrets: `RUSTGATE_CONTROL_PLANE_TOKEN_FILE` reads the control bearer, and `RUSTGATE_UPSTREAM_KEYS_FILE` reads a JSON key-ID-to-credential object. A file setting overrides the corresponding TOML value. Setting both a direct secret environment variable and its `_FILE` variant is an error, even if one is empty. One terminal LF or CRLF is removed; other whitespace is not stripped from credentials. Missing/unreadable/invalid files fail startup without exposing their paths or contents. Secret files, upstream CA bundles, and TLS material are read at startup; restart to rotate them.
 
 Each timeout must be an integer between 1 and 86400 seconds. The deadlines are independent: the earliest applicable deadline wins. Size concurrency for the deployment's expected parallel builds; processes sharing SQLite still have independent resource limits.
 
@@ -419,7 +422,7 @@ Retention, when authorized, is an **offline maintenance procedure**, not a runni
 
 #### Single-host installation and trusted TLS
 
-The baseline is one Linux/systemd host, one dedicated unprivileged `rustgate` account, one persistent SQLite database on a local filesystem with working OS locks, and a private HTTPS listener. No mock, shared/network filesystem, replicas sharing one database, public ingress, or container-distributed SQLite. The service unit's sandbox protects the host filesystem; **it is not an egress firewall**.
+The systemd baseline is one Linux host, one dedicated unprivileged `rustgate` account, one persistent SQLite database on a local filesystem with working OS locks, and a private HTTPS listener. The container alternative below keeps the same single-instance/local-state boundary. No production mock, shared/network filesystem, replicas sharing one database, public ingress, or container-distributed SQLite. Neither the service unit's sandbox nor Docker networking is an egress firewall.
 
 1. Build the release `rustgate` binary from the approved source revision on a trusted build host (`cargo build --release --bin rustgate`). Install only that binary, not `mock-upstream`, on the production host. Record the source revision and artifact checksum in your release inventory. Install the `sqlite3` CLI, CA trust prerequisites and systemd using the host's supported package manager.
 2. Create the account and install the supplied unit and production configuration from the checkout:
@@ -436,7 +439,7 @@ The baseline is one Linux/systemd host, one dedicated unprivileged `rustgate` ac
    Adapt the nologin path to the host; skip account creation if the dedicated account already exists. systemd creates `/var/lib/rustgate` owned by this account with mode `0700`. Do not put the binary/configuration in that writable directory.
 3. Replace `proxy_url`'s example DNS name with the real private name and port. The production TOML initially binds **loopback only**. For remote builders, set `listen_addr` to the host's explicitly selected private/WireGuard IP and allow only trusted builder/control/monitoring sources through the host/network firewall. Do not switch to a wildcard public listener. The same listener serves data, control and monitoring routes, so path-based restrictions, if required, need a separately administered trusted gateway.
 4. Obtain a valid certificate chain and key for that exact DNS name from an organizational CA trusted by builders and monitoring clients (or an appropriate public CA for an owned private deployment name). Install the chain as `/etc/rustgate/tls/fullchain.pem` and key as `/etc/rustgate/tls/privkey.pem`, root-owned, group `rustgate`, mode `0640`; keep their directory root-owned `0750`. Distribute the CA through trusted client provisioning. Never deploy the development self-signed example or disable certificate verification.
-5. The configured upstream is `https://api.mistral.ai`; use an approved compatible HTTPS provider if changing it. Validate provider certificate trust and the token-budget compatibility assumptions above. There is no application configuration for custom upstream CA bundles or disabling TLS verification; do not assume setting a generic CA environment variable adds unsupported trust.
+5. The configured upstream is `https://api.mistral.ai`; use an approved compatible HTTPS provider if changing it. Validate provider certificate trust and the token-budget compatibility assumptions above. For a private CA, set `upstream_ca_cert_path` (or `RUSTGATE_UPSTREAM_CA_CERT_PATH`) to a readable PEM CA bundle; these roots supplement built-in trust, never disable certificate/hostname verification. Generic CA environment variables are not an application trust configuration.
 
 #### Secret provisioning and startup
 
@@ -451,7 +454,7 @@ sudo chmod 0600 /etc/rustgate/rustgate.env
 sudoedit /etc/rustgate/rustgate.env
 ```
 
-Run the generation command only for initial provisioning; rerunning it rotates the control credential. In the root-only editor or trusted secret provisioning tool, add `RUSTGATE_UPSTREAM_KEYS` as a single-quoted JSON object mapping non-secret key IDs to actual provider credentials. Preserve JSON escaping and systemd quoting; credentials must be nonempty visible ASCII without whitespace. Do not add active dummy values. Deliver the control bearer to the trusted builder/control client and monitoring credential file through a secure secret channel, never a job environment. No credential `_FILE` settings, dynamic Vault retrieval, or live reload are implemented. Environment secrets remain visible to root and the service process; exclude the account from interactive/shared workloads and protect process diagnostics/core dumps.
+Run the generation command only for initial provisioning; rerunning it rotates the control credential. In the root-only editor or trusted secret provisioning tool, add `RUSTGATE_UPSTREAM_KEYS` as a single-quoted JSON object mapping non-secret key IDs to actual provider credentials. Preserve JSON escaping and systemd quoting; credentials must be nonempty visible ASCII without whitespace. Do not add active dummy values. Deliver the control bearer to the trusted builder/control client and monitoring credential file through a secure secret channel, never a job environment. Alternatively provision files readable by the service account and set the two credential `_FILE` variables instead of direct secret variables. No dynamic Vault retrieval or live reload is implemented. Environment secrets remain visible to root and the service process; exclude the account from interactive/shared workloads and protect process diagnostics/core dumps.
 
 Before starting, complete the external boundary checklist below. Then:
 
@@ -526,6 +529,92 @@ All configuration, credentials and TLS material load at startup. There is no SIG
 Use an isolated deployment and fake secrets with the loopback fixture, never production credentials in its capture API. Exercise issuance, incremental SSE, known/unknown usage, concurrent quota exhaustion, possible-secret blocking, revocation with admitted work draining, graceful restart and crash recovery. Check authenticated usage and metrics before/after restart; attempt both endpoints with absent/job credentials; inspect log/metric output for sentinel credentials, body/query/header/model markers and regex text. Confirm durable totals survive and process counters reset. Then separately complete the real-network firewall/TLS/backup-restore checks above. These are required operator acceptance steps, **not a claim that this document or the supplied deployment files have already been exercised on your host**.
 
 
+
+### Container images and Docker Compose
+
+One multi-stage `Dockerfile` builds both binaries in a shared Rust builder stage and produces **two separate images**. Target `rustgate` (also the default target) contains only the production executable; target `mock-upstream` contains only the fixture executable. Neither runtime contains Rust or the source tree. Both use Debian bookworm, curl for health checks, and UID/GID `10001:10001`. The build-context allowlist excludes everything except the manifest, lockfile, Dockerfile, and Rust sources.
+
+```sh
+docker build --target rustgate -t rustgate:local .
+docker build --target mock-upstream -t rustgate-mock:local .
+```
+
+With Podman (including a Docker CLI shim backed by Podman), add `--format docker` to both build commands; OCI-format builds discard Docker `HEALTHCHECK` metadata. CI uses Docker directly.
+
+`deploy/compose.yaml` runs production RustGate against an HTTPS provider, using project name `rustgate`. `deploy/compose.mock.yaml` selects project name `rustgate-mock` to keep development state separate; a separate mock container shares RustGate's network namespace, keeping HTTP on `127.0.0.1:9090`. The mock port is never published. Never give the mock real provider credentials; its capture API exposes credentials and bodies. Avoid overriding the two project names to the same value.
+
+#### Local mock quick start
+
+From the repository root, generate development-only TLS and fake credentials:
+
+```sh
+umask 077
+mkdir -p deploy/local/tls deploy/local/secrets
+chmod 0700 deploy/local deploy/local/secrets
+openssl req -x509 -newkey rsa:3072 -nodes \
+  -keyout deploy/local/tls/privkey.pem \
+  -out deploy/local/tls/fullchain.pem -days 7 -subj '/CN=localhost' \
+  -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1'
+cp deploy/local/tls/fullchain.pem deploy/local/tls/ca.pem
+openssl rand -hex 32 > deploy/local/secrets/control-token
+printf '%s\n' '{"primary":"fake-upstream-credential"}' \
+  > deploy/local/secrets/upstream-keys.json
+# Files must be readable by container UID10001. The host parent stays 0700.
+chmod 0755 deploy/local/tls
+chmod 0644 deploy/local/tls/*.pem deploy/local/secrets/*
+docker compose -f deploy/compose.yaml -f deploy/compose.mock.yaml \
+  up --build -d --wait
+curl --fail --cacert deploy/local/tls/ca.pem https://localhost:8443/healthz
+```
+
+Use the job-issuance/proxy examples above with the control bearer read from `deploy/local/secrets/control-token` and upstream key ID `primary`. Do not put the control bearer or provider credential in a build container. `deploy/local/` is Git-ignored and excluded from the image context. Compose file-backed secrets are read-only mounts, not an encrypted secret store: protect the host directory. On SELinux hosts, label the local secret files for container access (`chcon -R -t container_file_t deploy/local/secrets`); configuration/TLS binds request the shared `z` label. Rootless engines must also map file ownership/read access correctly.
+
+#### Production container setup
+
+Provision trusted `fullchain.pem`, `privkey.pem`, and client-issuing `ca.pem`; no generated development certificate or fake provider credential belongs in production. Mounts must be readable by UID/GID10001 inside the container while retaining restrictive host ownership and permissions. Configure these Compose interpolation variables through a protected operator environment or `--env-file` (paths/nonsecret settings only):
+
+| Variable | Purpose |
+| --- | --- |
+| `RUSTGATE_IMAGE` | Released `ghcr.io/<owner>/<repository>:v<version>`, preferably pinned by digest |
+| `RUSTGATE_TLS_DIR` | Absolute directory containing the three TLS files |
+| `RUSTGATE_CONTROL_TOKEN_PATH` | Absolute control-bearer secret file |
+| `RUSTGATE_UPSTREAM_KEYS_PATH` | Absolute provider-key JSON secret file |
+| `RUSTGATE_PROXY_URL` | Client-reachable HTTPS URL ending in `/v1` |
+| `RUSTGATE_HEALTHCHECK_URL` | `https://<certificate-name>:8443/healthz`; health connects to container loopback while verifying this name |
+| `RUSTGATE_BIND_IP`, `RUSTGATE_PORT` | Selected private host address/port; defaults `127.0.0.1:8443` |
+| `RUSTGATE_UPSTREAM_BASE_URL` | HTTPS provider base URL, default `https://api.mistral.ai`; request paths already include `/v1` |
+| `RUSTGATE_CONFIG_PATH` | Optional absolute replacement for `deploy/rustgate.container.toml` |
+
+```sh
+docker compose -f deploy/compose.yaml pull
+docker compose -f deploy/compose.yaml up -d --no-build --wait
+```
+
+For a private-CA upstream, place `upstream-ca.pem` in the mounted TLS directory and set `upstream_ca_cert_path` in the selected TOML file. There is no insecure-TLS switch. Health checks prove only liveness and server certificate trust, not provider reachability or credential validity.
+
+Compose uses a read-only root filesystem, drops capabilities, enables no-new-privileges, and mounts the whole state directory in `rustgate-state`. Keep this named volume on a local filesystem, one service instance only; do not scale the service or use `down -v`. Existing backup/restore and network-acceptance requirements apply, including Docker forwarding/NAT and IPv6 paths. Binding `0.0.0.0` is confined to the container namespace; host publication defaults to loopback.
+
+#### Drain, restart, and upgrade
+
+An ordinary Compose stop allows 15 minutes, longer than the default 10-minute request deadline, but a SQLite writer can delay drain indefinitely. For planned stops/upgrades, stop admitting work and use Docker's unlimited stop timeout:
+
+```sh
+# Add -f deploy/compose.mock.yaml to the Compose command when using the fixture.
+docker stop --timeout=-1 "$(docker compose -f deploy/compose.yaml ps -q rustgate)"
+docker compose -f deploy/compose.yaml down
+# After selecting/pulling the approved image and rotating any files:
+docker compose -f deploy/compose.yaml up -d --no-build --wait
+```
+
+Keep the mock running until RustGate drains; then remove/recreate both containers using both Compose files. Recreating the gateway gives it a new network namespace, so an old mock container must not be reused. `down` without `-v` retains state. A forced kill records accounting uncertainty on recovery as described above; do not silently shorten stop timeouts.
+
+CI's `scripts/container-smoke.py` exercises the actual images with disposable certificates and fake secrets: HTTPS health, credential replacement/prompt injection, JSON and incremental SSE, restart persistence, SIGTERM drain, and trusted/untrusted HTTPS upstreams. To run it locally after building the two images:
+
+```sh
+RUSTGATE_IMAGE=rustgate:local RUSTGATE_MOCK_IMAGE=rustgate-mock:local \
+  python3 scripts/container-smoke.py
+# Set CONTAINER_ENGINE=podman when using Podman directly.
+```
 
 ### Local mock upstream
 
@@ -604,9 +693,13 @@ If OpenCode reports `OpenAI Chat stream ended without finish_reason`, first rebu
 
 `.github/workflows/ci.yml` builds both executables and runs all-target tests in the release profile on every push, pull request, and published GitHub Release, including prereleases. Cargo uses `--locked`; commit `Cargo.lock` updates alongside dependency or package-version changes. The target is Linux x86-64 (`x86_64-unknown-linux-gnu`) on Ubuntu 24.04 with stable Rust. These are glibc-based executables, not static musl builds; use a compatible deployment host.
 
-Every successful run preserves a CI artifact containing only the production `rustgate` executable in `rustgate-v<version>-x86_64-unknown-linux-gnu.tar.gz`, plus `SHA256SUMS`. `mock-upstream` is built and tested but is not distributed. Publishing a GitHub Release additionally uploads those same files to that release after the build, tests, and executable-version smoke check pass. A tag push alone does not upload release assets. The upload job alone receives `contents: write` through GitHub's built-in token; no separate deployment secret is required. Re-running the workflow replaces same-named release assets.
+Every successful run preserves a CI artifact containing only the production `rustgate` executable in `rustgate-v<version>-x86_64-unknown-linux-gnu.tar.gz`, plus `SHA256SUMS`. `mock-upstream` is excluded from that archive and distributed only in its separate fixture image. Publishing a GitHub Release additionally uploads the same archive/checksum after the build, tests, and executable-version smoke check pass. A tag push alone does not publish release assets or images. The archive upload job alone receives `contents: write` through GitHub's built-in token; no separate deployment secret is required. Re-running the workflow replaces same-named release assets.
 
 `Cargo.toml`'s `package.version` is the single source of truth. `rustgate --version` (or `-V`) prints that compile-time version and exits successfully without loading configuration, certificates, or the database. Release tags must be exactly `v<package.version>`; CI rejects a mismatch before building or uploading. SemVer prereleases work the same way, for example package version `1.2.0-rc.1` and tag `v1.2.0-rc.1`. The GitHub Release title is descriptive and does not set the version.
+
+After the binary job succeeds, CI builds both Linux amd64 runtime targets and smoke-tests the containers on pushes, pull requests, and releases. Non-release runs never publish images. A release run saves the two tested images as an artifact; a separate release-only job loads that artifact and pushes it to GHCR **without rebuilding**. Only this publisher receives `packages: write`, authenticating with `GITHUB_TOKEN`. Repository names are lowercased: `ghcr.io/<owner>/<repository>` and `ghcr.io/<owner>/<repository>-mock`. Each receives the release's `v<version>` tag and a full `sha-<commit>` tag; SemVer build metadata's `+` is mapped to `_` in the container tag because registries forbid `+`. `latest` is updated only for a non-prerelease release whose package version is not a SemVer prerelease. OCI labels identify the original version, source, and commit. The workflow summary records published digests; production operators should deploy by digest.
+
+Publishing two images is not atomic. A failed push fails the publisher visibly; rerun that failed job to reuse the retained tested-image artifact rather than rebuilding or retagging another commit. GitHub package visibility/access is administered separately; configure the GHCR packages for the intended consumers. The initial image platform is Linux amd64, matching the existing binary CI target.
 
 Release procedure:
 
@@ -621,7 +714,7 @@ Release procedure:
    ./rustgate --version
    ```
 
-Keep the source tag/revision and checksum in the release inventory described in the deployment runbook. Release automation attaches binaries to GitHub Releases; it does not restart or modify production hosts.
+Keep the source tag/revision, archive checksum, and image digest in the release inventory described in the deployment runbook. Release automation publishes binaries and images; it does not restart or modify production deployments.
 
 ### Checks
 

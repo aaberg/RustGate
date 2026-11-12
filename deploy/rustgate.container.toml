@@ -1,0 +1,15 @@
+# Container baseline; credentials are supplied through mounted secret files.
+# Binding all container interfaces is intentional; restrict host publishing.
+listen_addr = "0.0.0.0:8443"
+upstream_base_url = "https://api.mistral.ai"
+tls_cert_path = "/etc/rustgate/tls/fullchain.pem"
+tls_key_path = "/etc/rustgate/tls/privkey.pem"
+database_path = "/var/lib/rustgate/rustgate.sqlite3"
+proxy_url = "https://localhost:8443/v1"
+# For a private-CA upstream, mount a PEM CA bundle read-only and set:
+# upstream_ca_cert_path = "/etc/rustgate/tls/upstream-ca.pem"
+connect_timeout_seconds = 5
+first_byte_timeout_seconds = 60
+idle_timeout_seconds = 120
+overall_timeout_seconds = 600
+max_in_flight_requests = 64

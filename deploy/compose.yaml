@@ -1,0 +1,38 @@
+name: rustgate
+
+services:
+  rustgate:
+    image: ${RUSTGATE_IMAGE:-rustgate:local}
+    build:
+      context: ..
+      target: rustgate
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    # Stop can wait indefinitely for SQLite workers. Never use Docker's default
+    # ten-second forced kill; see the documented drain-aware stop procedure.
+    stop_grace_period: 15m
+    ports:
+      - "${RUSTGATE_BIND_IP:-127.0.0.1}:${RUSTGATE_PORT:-8443}:8443"
+    environment:
+      RUSTGATE_CONFIG: /etc/rustgate/rustgate.toml
+      RUSTGATE_CONTROL_PLANE_TOKEN_FILE: /run/secrets/control_token
+      RUSTGATE_UPSTREAM_KEYS_FILE: /run/secrets/upstream_keys
+      RUSTGATE_UPSTREAM_BASE_URL: ${RUSTGATE_UPSTREAM_BASE_URL:-https://api.mistral.ai}
+      RUSTGATE_PROXY_URL: ${RUSTGATE_PROXY_URL:-https://localhost:8443/v1}
+      RUSTGATE_HEALTHCHECK_URL: ${RUSTGATE_HEALTHCHECK_URL:-https://localhost:8443/healthz}
+    volumes:
+      - "${RUSTGATE_CONFIG_PATH:-./rustgate.container.toml}:/etc/rustgate/rustgate.toml:ro,z"
+      - "${RUSTGATE_TLS_DIR:-./local/tls}:/etc/rustgate/tls:ro,z"
+      - rustgate-state:/var/lib/rustgate
+    secrets: [control_token, upstream_keys]
+
+secrets:
+  control_token:
+    file: ${RUSTGATE_CONTROL_TOKEN_PATH:-./local/secrets/control-token}
+  upstream_keys:
+    file: ${RUSTGATE_UPSTREAM_KEYS_PATH:-./local/secrets/upstream-keys.json}
+
+volumes:
+  rustgate-state:

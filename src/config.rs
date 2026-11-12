@@ -16,6 +16,7 @@ const DEFAULT_UPSTREAM_BASE_URL: &str = "http://127.0.0.1:9090";
 pub struct Config {
     pub listen_addr: SocketAddr,
     pub upstream_base_url: Url,
+    pub upstream_ca_cert_path: Option<PathBuf>,
     pub tls_cert_path: PathBuf,
     pub tls_key_path: PathBuf,
     pub database_path: PathBuf,
@@ -48,6 +49,7 @@ impl fmt::Debug for Config {
 struct FileConfig {
     listen_addr: Option<String>,
     upstream_base_url: Option<String>,
+    upstream_ca_cert_path: Option<String>,
     tls_cert_path: Option<String>,
     tls_key_path: Option<String>,
     database_path: Option<String>,
@@ -107,6 +109,38 @@ fn env_value(env: &mut impl FnMut(&str) -> Option<OsString>, name: &str) -> Resu
         .transpose()
 }
 
+fn secret_env_value(
+    env: &mut impl FnMut(&str) -> Option<OsString>,
+    read_file: &mut impl FnMut(&Path) -> std::io::Result<String>,
+    name: &'static str,
+    file_name: &'static str,
+) -> Result<Option<String>> {
+    let direct = env(name);
+    let file = env(file_name);
+    if direct.is_some() && file.is_some() {
+        bail!("{name} and {file_name} cannot both be set");
+    }
+    if let Some(path) = file {
+        let mut contents = read_file(Path::new(&path))
+            .map_err(|_| anyhow!("could not read mounted credential selected by {file_name}"))?;
+        // Remove exactly one line ending, never credential whitespace.
+        if contents.ends_with('\n') {
+            contents.pop();
+            if contents.ends_with('\r') {
+                contents.pop();
+            }
+        }
+        return Ok(Some(contents));
+    }
+    direct
+        .map(|value| {
+            value
+                .into_string()
+                .map_err(|_| anyhow!("{name} must contain valid Unicode"))
+        })
+        .transpose()
+}
+
 fn required(value: Option<String>, name: &str) -> Result<String> {
     value
         .filter(|value| !value.trim().is_empty())
@@ -127,7 +161,7 @@ pub(crate) fn validate_policy_patterns(patterns: &[String], field: &'static str)
 
 fn load_with(
     mut env: impl FnMut(&str) -> Option<OsString>,
-    read_file: impl FnOnce(&Path) -> std::io::Result<String>,
+    mut read_file: impl FnMut(&Path) -> std::io::Result<String>,
 ) -> Result<Config> {
     let mut settings = match env_value(&mut env, "RUSTGATE_CONFIG")? {
         Some(path) => {
@@ -150,10 +184,10 @@ fn load_with(
     strings!(
         listen_addr,
         upstream_base_url,
+        upstream_ca_cert_path,
         tls_cert_path,
         tls_key_path,
         database_path,
-        control_plane_token,
         proxy_url
     );
     macro_rules! numbers {
@@ -176,7 +210,20 @@ fn load_with(
         overall_timeout_seconds,
         max_in_flight_requests
     );
-    if let Some(value) = env_value(&mut env, "RUSTGATE_UPSTREAM_KEYS")? {
+    if let Some(value) = secret_env_value(
+        &mut env,
+        &mut read_file,
+        "RUSTGATE_CONTROL_PLANE_TOKEN",
+        "RUSTGATE_CONTROL_PLANE_TOKEN_FILE",
+    )? {
+        settings.control_plane_token = Some(value);
+    }
+    if let Some(value) = secret_env_value(
+        &mut env,
+        &mut read_file,
+        "RUSTGATE_UPSTREAM_KEYS",
+        "RUSTGATE_UPSTREAM_KEYS_FILE",
+    )? {
         settings.upstream_keys = Some(serde_json::from_str(&value).map_err(|_| {
             anyhow!("invalid upstream_keys: expected a JSON object of string credentials")
         })?);
@@ -210,6 +257,10 @@ fn load_with(
     )
     .map_err(|_| anyhow!("invalid upstream_base_url: expected an absolute HTTP(S) URL"))?;
     validate_upstream(&upstream_base_url)?;
+    let upstream_ca_cert_path = settings
+        .upstream_ca_cert_path
+        .map(|path| required(Some(path), "upstream_ca_cert_path").map(PathBuf::from))
+        .transpose()?;
     let tls_cert_path = PathBuf::from(required(settings.tls_cert_path, "tls_cert_path")?);
     let tls_key_path = PathBuf::from(required(settings.tls_key_path, "tls_key_path")?);
     let database = settings
@@ -307,6 +358,7 @@ fn load_with(
     Ok(Config {
         listen_addr,
         upstream_base_url,
+        upstream_ca_cert_path,
         tls_cert_path,
         tls_key_path,
         database_path: database.into(),
@@ -386,6 +438,209 @@ mod tests {
         let mut values = env.to_vec();
         values.extend_from_slice(SECURITY);
         load(&values, file)
+    }
+
+    fn mounted(env: &[(&str, &str)], files: &[(&str, &str)]) -> Result<Config> {
+        let mut values = env.to_vec();
+        values.extend(SECURITY.iter().copied().filter(|(name, _)| {
+            !env.iter().any(|(key, _)| {
+                key == name
+                    || (*name == "RUSTGATE_CONTROL_PLANE_TOKEN"
+                        && *key == "RUSTGATE_CONTROL_PLANE_TOKEN_FILE")
+                    || (*name == "RUSTGATE_UPSTREAM_KEYS" && *key == "RUSTGATE_UPSTREAM_KEYS_FILE")
+            })
+        }));
+        load_with(
+            |name| {
+                values
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| OsString::from(*value))
+            },
+            |path| {
+                files
+                    .iter()
+                    .find(|(name, _)| Path::new(name) == path)
+                    .map(|(_, contents)| (*contents).to_owned())
+                    .ok_or_else(|| std::io::Error::other("private-read-error"))
+            },
+        )
+    }
+
+    #[test]
+    fn mounted_credentials_override_toml_and_are_read_once() {
+        for ending in ["", "\n", "\r\n"] {
+            let token = format!("01234567890123456789012345678901{ending}");
+            let keys = format!("{{\"mounted\":\"credential\"}}{ending}");
+            let mut reads = Vec::new();
+            let config = load_with(
+                |name| match name {
+                    "RUSTGATE_CONFIG" => Some("config".into()),
+                    "RUSTGATE_CONTROL_PLANE_TOKEN_FILE" => Some("token".into()),
+                    "RUSTGATE_UPSTREAM_KEYS_FILE" => Some("keys".into()),
+                    _ => SECURITY
+                        .iter()
+                        .filter(|(key, _)| {
+                            *key != "RUSTGATE_CONTROL_PLANE_TOKEN"
+                                && *key != "RUSTGATE_UPSTREAM_KEYS"
+                        })
+                        .find(|(key, _)| *key == name)
+                        .map(|(_, value)| OsString::from(*value)),
+                },
+                |path| {
+                    reads.push(path.to_owned());
+                    Ok(match path.to_str().unwrap() {
+                        "config" => {
+                            "control_plane_token = 'toml-token'\n[upstream_keys]\ntoml = 'toml-key'"
+                                .to_owned()
+                        }
+                        "token" => token.clone(),
+                        "keys" => keys.clone(),
+                        _ => panic!("unexpected file read"),
+                    })
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                config.control_plane_token,
+                "01234567890123456789012345678901"
+            );
+            assert_eq!(
+                config.upstream_keys,
+                HashMap::from([("mounted".to_owned(), "credential".to_owned())])
+            );
+            assert_eq!(
+                reads,
+                [
+                    PathBuf::from("config"),
+                    PathBuf::from("token"),
+                    PathBuf::from("keys")
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn mounted_credentials_conflict_with_even_empty_direct_environment() {
+        for (direct, file) in [
+            (
+                "RUSTGATE_CONTROL_PLANE_TOKEN",
+                "RUSTGATE_CONTROL_PLANE_TOKEN_FILE",
+            ),
+            ("RUSTGATE_UPSTREAM_KEYS", "RUSTGATE_UPSTREAM_KEYS_FILE"),
+        ] {
+            for direct_value in ["", "private-direct-value"] {
+                for file_value in ["", "private-path"] {
+                    let error = load_with(
+                        |name| {
+                            if name == direct {
+                                Some(direct_value.into())
+                            } else if name == file {
+                                Some(file_value.into())
+                            } else {
+                                None
+                            }
+                        },
+                        |_| panic!("conflicting credentials must not be read"),
+                    )
+                    .unwrap_err();
+                    assert_eq!(
+                        error.to_string(),
+                        format!("{direct} and {file} cannot both be set")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mounted_credentials_read_and_parse_errors_are_redacted() {
+        for (name, contents) in [
+            ("RUSTGATE_CONTROL_PLANE_TOKEN_FILE", None),
+            ("RUSTGATE_CONTROL_PLANE_TOKEN_FILE", Some("")),
+            ("RUSTGATE_CONTROL_PLANE_TOKEN_FILE", Some("private-short")),
+            (
+                "RUSTGATE_CONTROL_PLANE_TOKEN_FILE",
+                Some("01234567890123456789012345678901 "),
+            ),
+            (
+                "RUSTGATE_CONTROL_PLANE_TOKEN_FILE",
+                Some("01234567890123456789012345678901\n\n"),
+            ),
+            (
+                "RUSTGATE_CONTROL_PLANE_TOKEN_FILE",
+                Some("01234567890123456789012345678901\r"),
+            ),
+            ("RUSTGATE_UPSTREAM_KEYS_FILE", None),
+            ("RUSTGATE_UPSTREAM_KEYS_FILE", Some("private-invalid-json")),
+            ("RUSTGATE_UPSTREAM_KEYS_FILE", Some(r#"{"private-id":7}"#)),
+            (
+                "RUSTGATE_UPSTREAM_KEYS_FILE",
+                Some(r#"{"private-id":"private key"}"#),
+            ),
+            ("RUSTGATE_UPSTREAM_KEYS_FILE", Some("{}")),
+        ] {
+            let files: Vec<_> = contents
+                .map(|contents| ("private-path", contents))
+                .into_iter()
+                .collect();
+            let error = mounted(&[(name, "private-path")], &files).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(!message.contains("private"), "{message}");
+            if contents.is_none() {
+                assert_eq!(
+                    message,
+                    format!("could not read mounted credential selected by {name}")
+                );
+            }
+        }
+        let error = mounted(&[("RUSTGATE_CONTROL_PLANE_TOKEN_FILE", "")], &[]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("could not read mounted credential")
+        );
+    }
+
+    #[test]
+    fn mounted_credentials_preserve_nonterminal_whitespace() {
+        let config = mounted(
+            &[
+                (
+                    "RUSTGATE_CONTROL_PLANE_TOKEN",
+                    "01234567890123456789012345678901",
+                ),
+                ("RUSTGATE_UPSTREAM_KEYS_FILE", "keys"),
+            ],
+            &[("keys", " \n{\" mounted \":\"credential\"}\n \r\n")],
+        )
+        .unwrap();
+        assert_eq!(config.upstream_keys[" mounted "], "credential");
+    }
+
+    #[test]
+    fn upstream_ca_path_is_optional_and_environment_overrides_toml() {
+        assert!(secured(&[], None).unwrap().upstream_ca_cert_path.is_none());
+        let file = "upstream_ca_cert_path = 'file-ca.pem'";
+        assert_eq!(
+            secured(&[("RUSTGATE_CONFIG", "settings.toml")], Some(file))
+                .unwrap()
+                .upstream_ca_cert_path,
+            Some(PathBuf::from("file-ca.pem")),
+        );
+        assert_eq!(
+            secured(
+                &[
+                    ("RUSTGATE_CONFIG", "settings.toml"),
+                    ("RUSTGATE_UPSTREAM_CA_CERT_PATH", "env-ca.pem")
+                ],
+                Some(file)
+            )
+            .unwrap()
+            .upstream_ca_cert_path,
+            Some(PathBuf::from("env-ca.pem")),
+        );
+        assert!(secured(&[("RUSTGATE_UPSTREAM_CA_CERT_PATH", "")], None).is_err());
     }
 
     #[test]
