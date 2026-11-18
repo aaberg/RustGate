@@ -49,15 +49,16 @@ Stop both servers with `Ctrl+C` in their respective terminals. Local job state s
 
 ## Run against Mistral
 
-For a local test with a real upstream, [create an API key in Mistral Studio](https://docs.mistral.ai/getting-started/quickstarts/studio/activate-and-generate-api-key). This example also uses Bash, `jq`, and `uuidgen`. RustGate needs outbound HTTPS access to `api.mistral.ai:443`; the test chat request may incur Mistral charges.
+For a local test with a real upstream, [create an API key in Mistral Studio](https://docs.mistral.ai/getting-started/quickstarts/studio/activate-and-generate-api-key). This example uses Bash or Zsh, plus `jq` and `uuidgen`. RustGate needs outbound HTTPS access to `api.mistral.ai:443`; the test chat request may incur Mistral charges.
 
 1. From the repository root, run `cargo build --locked --bin rustgate` and generate `cert.pem` and `key.pem` as in step 2 of [Run locally](#run-locally). Leave port `8443` free and skip the mock upstream.
 
-2. In a trusted Bash terminal with shell tracing off, paste the Mistral key at the hidden prompt. Start RustGate on loopback with a separate SQLite database and a key-pool entry named `mistral`:
+2. In a trusted terminal with shell tracing off, paste the Mistral key at the hidden prompt. Start RustGate on loopback with a separate SQLite database and a key-pool entry named `mistral`:
 
    ```bash
-   read -rsp 'Mistral API key: ' mistral_key
-   printf '\n'
+   printf 'Mistral API key: ' >&2
+   IFS= read -rs mistral_key
+   printf '\n' >&2
    control_token="$(openssl rand -hex 32)"
 
    RUSTGATE_CONFIG=rustgate.example.toml \
