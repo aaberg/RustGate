@@ -47,6 +47,61 @@ These steps use the bundled mock upstream. No Mistral account or real API key is
 
 Stop both servers with `Ctrl+C` in their respective terminals. Local job state stays in `rustgate.sqlite3` across restarts.
 
+## Run against Mistral
+
+For a local test with a real upstream, [create an API key in Mistral Studio](https://docs.mistral.ai/getting-started/quickstarts/studio/activate-and-generate-api-key). This example also uses Bash, `jq`, and `uuidgen`. RustGate needs outbound HTTPS access to `api.mistral.ai:443`; the test chat request may incur Mistral charges.
+
+1. From the repository root, run `cargo build --locked --bin rustgate` and generate `cert.pem` and `key.pem` as in step 2 of [Run locally](#run-locally). Leave port `8443` free and skip the mock upstream.
+
+2. In a trusted Bash terminal with shell tracing off, paste the Mistral key at the hidden prompt. Start RustGate on loopback with a separate SQLite database and a key-pool entry named `mistral`:
+
+   ```bash
+   read -rsp 'Mistral API key: ' mistral_key
+   printf '\n'
+   control_token="$(openssl rand -hex 32)"
+
+   RUSTGATE_CONFIG=rustgate.example.toml \
+     RUSTGATE_UPSTREAM_BASE_URL=https://api.mistral.ai \
+     RUSTGATE_DATABASE_PATH=rustgate.sqlite3.mistral \
+     RUSTGATE_CONTROL_PLANE_TOKEN="$control_token" \
+     RUSTGATE_UPSTREAM_KEYS="$(printf '%s' "$mistral_key" | jq -Rs '{mistral: .}')" \
+     ./target/debug/rustgate &
+   rustgate_pid=$!
+   unset mistral_key
+   ```
+
+   Set the upstream URL without `/v1`: RustGate appends the API path. The client base URL is `https://localhost:8443/v1`.
+
+3. After RustGate logs `listening`, use the same terminal to issue a short-lived job. `upstream_key_id` selects `mistral` from the key pool; it is not the API key.
+
+   ```bash
+   job_json="$(
+     printf 'Authorization: Bearer %s\n' "$control_token" |
+       curl -fsS --cacert cert.pem -H @- -H 'Content-Type: application/json' \
+         -d "$(jq -n --arg id "$(uuidgen)" '{
+           job_id: $id, tenant_id: "local-builder", upstream_key_id: "mistral",
+           system_prompt: "Answer briefly.", ttl_seconds: 300, max_requests: 3,
+           max_tokens_total: 2048
+         }')" \
+         https://localhost:8443/v1/jobs
+   )"
+   job_token="$(jq -er '.token' <<< "$job_json")"
+   unset job_json
+   ```
+
+4. Send a text chat request using only the job token. A successful response contains the Mistral completion in `choices[0].message.content`. If the example model isn't available to your workspace, use a chat model ID returned by `GET /v1/models` with the same job token.
+
+   ```bash
+   printf 'Authorization: Bearer %s\n' "$job_token" |
+     curl -fsS --cacert cert.pem -H @- -H 'Content-Type: application/json' \
+       -d '{"model":"mistral-small-latest","messages":[{"role":"user","content":"Say hello."}],"max_tokens":32,"stream":false}' \
+       https://localhost:8443/v1/chat/completions
+   ```
+
+   Give build containers only the job token and the client base URL, never the Mistral key or the control-plane token. To stop the local server, run `kill "$rustgate_pid"; wait "$rustgate_pid"` and `unset control_token job_token`.
+
 ## Deployment
 
-See the [production runbook](DESIGN.md#production-deployment-and-operations) for a private HTTPS deployment with trusted TLS and real upstream credentials, or the [Docker Compose guide](DESIGN.md#container-images-and-docker-compose) for containerized local and production setups. Do not use the mock or development certificate in production.
+The [production configuration](deploy/rustgate.toml) already points to `https://api.mistral.ai`. Follow the [production runbook](DESIGN.md#production-deployment-and-operations) to provision the `mistral` key-pool entry on the RustGate host and set up a private listener with trusted TLS. Do not deploy the mock or the local certificate.
+
+For containers, use the [Docker Compose guide](DESIGN.md#container-images-and-docker-compose) and its production configuration without the mock override.
