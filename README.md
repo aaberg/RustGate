@@ -101,6 +101,63 @@ For a local test with a real upstream, [create an API key in Mistral Studio](htt
 
    Give build containers only the job token and the client base URL, never the Mistral key or the control-plane token. To stop the local server, run `kill "$rustgate_pid"; wait "$rustgate_pid"` and `unset control_token job_token`.
 
+## Use RustGate with OpenCode
+
+This example uses [OpenCode 2](https://opencode.ai/docs/) and the local mock, so it does not require a Mistral API key. For OpenCode 1.x, see the [older provider configuration](DESIGN.md#testing-with-opencode).
+
+1. [Start RustGate and the mock](#run-locally), then [issue a job token](DESIGN.md#issuing-and-inspecting-a-job) with upstream key ID `local`. Use a fresh `job_id` for each new token.
+
+2. In the client terminal, from the RustGate checkout, load **only the job token** and point OpenCode at the development certificate. Do not give OpenCode the control-plane token or upstream API key.
+
+   ```sh
+   export NODE_EXTRA_CA_CERTS="$PWD/cert.pem"
+   ```
+
+   Set `RG_JOB_TOKEN` to the issued job token in that terminal. For example, in Bash or Zsh, with shell tracing off:
+
+   ```bash
+   printf 'RustGate job token: ' >&2
+   IFS= read -rs RG_JOB_TOKEN
+   printf '\n' >&2
+   export RG_JOB_TOKEN
+   ```
+
+3. Switch to the project directory where you want to use OpenCode. Add the following to `opencode.json`, merging it into your existing configuration if you have one:
+
+   ```json
+   {
+     "$schema": "https://opencode.ai/config.json",
+     "model": "rustgate/mock-mistral",
+     "providers": {
+       "rustgate": {
+         "name": "RustGate",
+         "env": ["RG_JOB_TOKEN"],
+         "package": "@opencode/ai/providers/openai-compatible",
+         "settings": {
+           "baseURL": "https://localhost:8443/v1"
+         },
+         "models": {
+           "mock-mistral": {
+             "name": "RustGate mock",
+             "capabilities": { "input": ["text"], "output": ["text"] },
+             "limit": { "context": 32768, "output": 4096 }
+           }
+         }
+       }
+     }
+   }
+   ```
+
+4. Run a test prompt from the same terminal and project directory:
+
+   ```sh
+   opencode run --standalone --model rustgate/mock-mistral "Say hello. Do not use tools."
+   ```
+
+   The mock should reply `Hello from mock.`. For the interactive UI, run `opencode --standalone`. Standalone mode starts a private OpenCode server that inherits the token and certificate settings from this shell.
+
+To use [real Mistral](#run-against-mistral), issue a job for upstream key ID `mistral` and replace `mock-mistral` in the model entry and selection with an available Mistral chat model ID, such as `mistral-small-latest`. Set the model limits for the selected model and issue a job with enough [request and token budget](DESIGN.md#hard-token-budgets) for OpenCode's prompts, tools, and multiple turns; the small curl test job above is not sized for this. If RustGate runs on another host, use the job's returned `proxy_url` as `baseURL` (including `/v1`) and trust that deployment's CA instead of the development certificate.
+
 ## Deployment
 
 The [production configuration](deploy/rustgate.toml) already points to `https://api.mistral.ai`. Follow the [production runbook](DESIGN.md#production-deployment-and-operations) to provision the `mistral` key-pool entry on the RustGate host and set up a private listener with trusted TLS. Do not deploy the mock or the local certificate.
